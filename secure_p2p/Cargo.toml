@@ -2,7 +2,7 @@
 members = [
     "crypto",
     "p2p_core",
-    "cli_app",
+    "cli_app", "ledger_core",
 ]
 
 [package]
