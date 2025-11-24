@@ -14,6 +14,14 @@ pub enum LedgerError {
     Bincode(#[from] Box<bincode::ErrorKind>),
 }
 
+/// Defines the roles a peer can have.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Role {
+    Reader,
+    Contributor,
+    Admin,
+}
+
 /// Defines the type of event being logged.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum EventType {
@@ -23,7 +31,14 @@ pub enum EventType {
     FileLockRequested { file_path: String },
     LockGranted { file_path: String },
     LockDenied { file_path: String },
-    FileUpdated { file_hash: Vec<u8> },
+    FileUpdated {
+        file_hash: Vec<u8>,
+        previous_manifest_hash: Option<Vec<u8>>,
+    },
+    RoleUpdate {
+        target_peer_id: Vec<u8>,
+        new_role: Role,
+    },
 }
 
 /// A separate struct containing only the fields to be hashed.
