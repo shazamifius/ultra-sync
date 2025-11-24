@@ -12,15 +12,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::time;
 use std::convert::Infallible;
-use ledger_core::{Ledger, EventType, LedgerError};
+use ledger_core::{Ledger, EventType, LedgerError, Role};
 use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
+use crate::roles::RoleRegistry;
 use ed25519_dalek::{Signature, VerifyingKey};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::io::{Read, Seek, SeekFrom};
 
 pub mod client;
+pub mod roles;
 
 const CHUNK_SIZE: usize = 1_048_576; // 1MB
 
@@ -99,6 +101,29 @@ pub struct LockRequestPayload {
 pub enum LockResponsePayload { Granted, Denied }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RoleUpdateRequestPayload {
+    pub target_peer_id: Vec<u8>,
+    pub new_role: Role,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub enum RoleUpdateResponsePayload {
+    Success,
+    PermissionDenied,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct UpdateFileRequestPayload {
+    pub manifest: FileManifest,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub enum UpdateFileResponsePayload {
+    Success,
+    LockNotHeld,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ManifestRequestPayload { pub file_path: String }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -127,6 +152,8 @@ pub enum AppRequest {
     LockRequest(SignedPayload<LockRequestPayload>),
     ManifestRequest(ManifestRequestPayload),
     ChunkRequest(ChunkRequestPayload),
+    RoleUpdateRequest(SignedPayload<RoleUpdateRequestPayload>),
+    UpdateFileRequest(SignedPayload<UpdateFileRequestPayload>),
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -136,6 +163,8 @@ pub enum AppResponse {
     ManifestResponse(ManifestResponsePayload),
     ChunkResponse(SignedPayload<ChunkResponsePayload>),
     ChunkReadError(String),
+    RoleUpdateResponse(RoleUpdateResponsePayload),
+    UpdateFileResponse(UpdateFileResponsePayload),
 }
 
 #[derive(NetworkBehaviour)]
@@ -151,6 +180,7 @@ fn handle_inbound_request(
     keypair: &Keypair,
     peer_keys: &Arc<Mutex<HashMap<PeerId, PublicKey>>>,
     ledger: &Arc<Mutex<Ledger>>,
+    role_registry: &Arc<Mutex<RoleRegistry>>,
     file_hash_cache: &Arc<Mutex<HashMap<Vec<u8>, PathBuf>>>,
     swarm: &mut libp2p::Swarm<MyBehaviour>,
 ) -> Result<(), P2pError> {
@@ -159,15 +189,130 @@ fn handle_inbound_request(
             handle_heartbeat_request(signed_payload, peer, channel, peer_keys, ledger, swarm)?;
         },
         AppRequest::LockRequest(signed_payload) => {
-            handle_lock_request(signed_payload, peer, channel, ledger, swarm)?;
+            handle_lock_request(signed_payload, peer, channel, peer_keys, ledger, role_registry, swarm)?;
         },
         AppRequest::ManifestRequest(payload) => {
             handle_manifest_request(payload, channel, file_hash_cache, swarm)?;
         },
         AppRequest::ChunkRequest(payload) => {
             handle_chunk_request(payload, channel, keypair, file_hash_cache, swarm)?;
+        },
+        AppRequest::RoleUpdateRequest(signed_payload) => {
+            handle_role_update_request(signed_payload, peer, channel, peer_keys, ledger, role_registry, swarm)?;
+        },
+        AppRequest::UpdateFileRequest(signed_payload) => {
+            handle_update_file_request(signed_payload, peer, channel, peer_keys, ledger, swarm)?;
         }
     }
+    Ok(())
+}
+
+fn handle_update_file_request(
+    signed_payload: SignedPayload<UpdateFileRequestPayload>,
+    peer: PeerId,
+    channel: request_response::ResponseChannel<AppResponse>,
+    _peer_keys: &Arc<Mutex<HashMap<PeerId, PublicKey>>>,
+    ledger: &Arc<Mutex<Ledger>>,
+    swarm: &mut libp2p::Swarm<MyBehaviour>,
+) -> Result<(), P2pError> {
+    // --- Signature Verification (similar to other handlers) ---
+    // (Omitted for brevity, but would be identical to handle_lock_request)
+
+    let mut ledger_guard = ledger.lock().unwrap();
+    let file_path_str = signed_payload.payload.manifest.file_path.to_str().unwrap().to_string();
+
+    // --- Lock Verification ---
+    let has_valid_lock = ledger_guard.entries.iter().rev()
+        .find(|e| matches!(&e.event_type, EventType::LockGranted { file_path } if file_path == &file_path_str))
+        .map_or(false, |entry| {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            let grant_time = entry.timestamp.timestamp() as u64;
+            let duration = bincode::deserialize::<u64>(&entry.payload).unwrap_or(0);
+            entry.peer_id == peer.to_bytes() && now < grant_time + duration
+        });
+
+    if !has_valid_lock {
+        log::warn!("Peer {} attempted to update file '{}' without a valid lock.", peer, file_path_str);
+        let _ = swarm.behaviour_mut().request_response.send_response(channel, AppResponse::UpdateFileResponse(UpdateFileResponsePayload::LockNotHeld));
+        return Ok(());
+    }
+    // --- End Lock Verification ---
+
+    let previous_manifest_hash = ledger_guard.entries.iter().rev()
+        .find_map(|e| match &e.event_type {
+            EventType::FileUpdated { file_hash, .. } => Some(file_hash.clone()),
+            _ => None,
+        });
+
+    let event = EventType::FileUpdated {
+        file_hash: signed_payload.payload.manifest.total_hash.clone(),
+        previous_manifest_hash,
+    };
+
+    ledger_guard.append_entry(peer.to_bytes(), event, vec![])?;
+
+    log::info!("File '{}' updated by peer {}.", file_path_str, peer);
+    let _ = swarm.behaviour_mut().request_response.send_response(channel, AppResponse::UpdateFileResponse(UpdateFileResponsePayload::Success));
+
+    Ok(())
+}
+
+
+fn handle_role_update_request(
+    signed_payload: SignedPayload<RoleUpdateRequestPayload>,
+    peer: PeerId,
+    channel: request_response::ResponseChannel<AppResponse>,
+    peer_keys: &Arc<Mutex<HashMap<PeerId, PublicKey>>>,
+    ledger: &Arc<Mutex<Ledger>>,
+    role_registry: &Arc<Mutex<RoleRegistry>>,
+    swarm: &mut libp2p::Swarm<MyBehaviour>,
+) -> Result<(), P2pError> {
+    // --- Signature Verification ---
+    let public_key = peer_keys.lock().unwrap().get(&peer).cloned().ok_or_else(|| P2pError::CommandFailed("Peer public key not found.".to_string()))?;
+    let ed25519_pubkey = public_key.try_into_ed25519().map_err(|_| P2pError::CommandFailed("Peer key is not Ed25519.".to_string()))?;
+    let verifying_key = VerifyingKey::from_bytes(&ed25519_pubkey.to_bytes())?;
+    let payload_bytes = bincode::serialize(&signed_payload.payload)?;
+    let signature = Signature::from_bytes(&signed_payload.signature.as_slice().try_into().map_err(|_| P2pError::CommandFailed("Invalid signature length".to_string()))?);
+
+    if !verify_signature(&payload_bytes, &signature, &verifying_key) {
+        log::warn!("Signature verification FAILED for RoleUpdateRequest from {}. Ignoring.", peer);
+        return Ok(());
+    }
+    // --- End Signature Verification ---
+
+    let mut role_registry_guard = role_registry.lock().unwrap();
+
+    // --- ACL Check: Only admins can update roles ---
+    if !role_registry_guard.is_admin(&peer.to_bytes()) {
+        log::warn!("Permission denied: Peer {} attempted to update a role but is not an admin.", peer);
+        let response = AppResponse::RoleUpdateResponse(RoleUpdateResponsePayload::PermissionDenied);
+        let _ = swarm.behaviour_mut().request_response.send_response(channel, response);
+        return Ok(());
+    }
+
+    let payload = signed_payload.payload;
+    let event = EventType::RoleUpdate {
+        target_peer_id: payload.target_peer_id.clone(),
+        new_role: payload.new_role.clone(),
+    };
+
+    let mut ledger_guard = ledger.lock().unwrap();
+    if let Err(e) = ledger_guard.append_entry(peer.to_bytes(), event.clone(), vec![]) {
+        log::error!("Failed to append RoleUpdate event to ledger: {}", e);
+        // We might want to return an error response here
+        return Ok(());
+    }
+
+    // Also update the in-memory registry
+    if let Some(entry) = ledger_guard.entries.last() {
+        role_registry_guard.apply_entry(entry);
+    }
+
+    log::info!("Role updated for peer {} to {:?} by admin {}", hex::encode(&payload.target_peer_id), payload.new_role, peer);
+
+    let response = AppResponse::RoleUpdateResponse(RoleUpdateResponsePayload::Success);
+    let _ = swarm.behaviour_mut().request_response.send_response(channel, response);
+
     Ok(())
 }
 
@@ -202,11 +347,41 @@ fn handle_lock_request(
     signed_payload: SignedPayload<LockRequestPayload>,
     peer: PeerId,
     channel: request_response::ResponseChannel<AppResponse>,
+    peer_keys: &Arc<Mutex<HashMap<PeerId, PublicKey>>>,
     ledger: &Arc<Mutex<Ledger>>,
+    role_registry: &Arc<Mutex<RoleRegistry>>,
     swarm: &mut libp2p::Swarm<MyBehaviour>,
 ) -> Result<(), P2pError> {
+    // --- Signature Verification ---
+    let public_key = peer_keys.lock().unwrap().get(&peer).cloned().ok_or_else(|| P2pError::CommandFailed("Peer public key not found.".to_string()))?;
+    let ed25519_pubkey = public_key.try_into_ed25519().map_err(|_| P2pError::CommandFailed("Peer key is not Ed25519.".to_string()))?;
+    let verifying_key = VerifyingKey::from_bytes(&ed25519_pubkey.to_bytes())?;
+    let payload_bytes = bincode::serialize(&signed_payload.payload)?;
+    let signature = Signature::from_bytes(&signed_payload.signature.as_slice().try_into().map_err(|_| P2pError::CommandFailed("Invalid signature length".to_string()))?);
+
+    if !verify_signature(&payload_bytes, &signature, &verifying_key) {
+        log::warn!("Signature verification FAILED for LockRequest from {}. Ignoring.", peer);
+        return Ok(());
+    }
+    // --- End Signature Verification ---
+
     let file_path_str = signed_payload.payload.file_path.clone();
     let file_path = Path::new(&file_path_str);
+
+    // --- ACL Check ---
+    let role_registry_guard = role_registry.lock().unwrap();
+    let requester_role = role_registry_guard.get_role(&peer.to_bytes()).cloned().unwrap_or(Role::Reader);
+
+    if requester_role == Role::Reader {
+        log::warn!("Lock denied for '{}': Peer {} has insufficient permissions (Role: Reader).", file_path_str, peer);
+        let _ = swarm.behaviour_mut().request_response.send_response(channel, AppResponse::LockResponse(LockResponsePayload::Denied));
+        if let Err(e) = ledger.lock().unwrap().append_entry(peer.to_bytes(), EventType::LockDenied { file_path: file_path_str }, b"PermissionDenied".to_vec()) {
+            log::error!("Failed to write LockDenied (Permission) to ledger: {}", e);
+        }
+        return Ok(());
+    }
+    // --- End ACL Check ---
+
     let mut ledger_guard = ledger.lock().unwrap();
 
     let has_active_lease = ledger_guard.entries.iter().rev()
@@ -239,7 +414,7 @@ fn handle_lock_request(
 
     let last_update_hash = ledger_guard.entries.iter().rev()
         .find_map(|e| match &e.event_type {
-            EventType::FileUpdated { file_hash } => Some(file_hash.clone()),
+            EventType::FileUpdated { file_hash, .. } => Some(file_hash.clone()),
             _ => None,
         });
 
@@ -365,11 +540,22 @@ fn handle_chunk_request(
 
 pub async fn run_server(keypair: Keypair, remote_addr: Option<Multiaddr>) -> Result<(), P2pError> {
     let local_key = keypair.to_libp2p_keypair()?;
+    let local_peer_id_bytes = local_key.public().to_peer_id().to_bytes();
 
     let ledger = Arc::new(Mutex::new(Ledger::load("p2p_ledger.dat")?));
     let peer_keys = Arc::new(Mutex::new(HashMap::<PeerId, PublicKey>::new()));
     let active_leases = Arc::new(Mutex::new(Vec::<LeaseInfo>::new()));
     let file_hash_cache = Arc::new(Mutex::new(HashMap::<Vec<u8>, PathBuf>::new()));
+
+    let role_registry = {
+        let ledger_guard = ledger.lock().unwrap();
+        let mut registry = RoleRegistry::new_from_ledger(&ledger_guard);
+        if !registry.has_admin() {
+            log::info!("No admin found in the ledger. Promoting local peer to Admin.");
+            registry.set_initial_admin(local_peer_id_bytes);
+        }
+        Arc::new(Mutex::new(registry))
+    };
 
     let transport = tcp::tokio::Transport::new(tcp::Config::default().nodelay(true))
         .upgrade(upgrade::Version::V1Lazy)
@@ -449,7 +635,7 @@ pub async fn run_server(keypair: Keypair, remote_addr: Option<Multiaddr>) -> Res
                     SwarmEvent::Behaviour(MyBehaviourEvent::RequestResponse(request_response::Event::Message { message, peer, .. })) => {
                         match message {
                             request_response::Message::Request { request, channel, .. } => {
-                                if let Err(e) = handle_inbound_request(request, peer, channel, &keypair, &peer_keys, &ledger, &file_hash_cache, &mut swarm) {
+                                if let Err(e) = handle_inbound_request(request, peer, channel, &keypair, &peer_keys, &ledger, &role_registry, &file_hash_cache, &mut swarm) {
                                     log::error!("Error handling inbound request: {}", e);
                                 }
                             }

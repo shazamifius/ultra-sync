@@ -1,11 +1,12 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use crypto::{generate_keypair, keypair_exists, load_keypair, save_keypair, CryptoError, Keypair};
-use p2p_core::{client::{run_client, ClientCommand}, run_server};
+use p2p_core::{client::{run_client, ClientCommand}, run_server, roles::RoleRegistry};
 use rpassword::prompt_password;
 use std::process;
-use ledger_core::EventType;
+use ledger_core::{EventType, Role};
 use chrono::{DateTime, Utc};
-use libp2p::Multiaddr;
+use libp2p::{Multiaddr, PeerId};
+use std::str::FromStr;
 
 #[derive(Parser, Debug)]
 #[clap(name = "secure-p2p-cli", version = "0.1.0", author = "Jules")]
@@ -46,6 +47,42 @@ enum Commands {
         #[clap(long)]
         peer_addr: Multiaddr,
     },
+    /// Set the role for a peer (Admin only)
+    SetRole {
+        #[clap(long)]
+        peer_id: String,
+        #[clap(long)]
+        role: CliRole,
+        #[clap(long)]
+        admin_peer: Multiaddr,
+    },
+    /// Show the current roles from the local ledger
+    ShowRoles,
+    /// Update a file after having acquired a lock
+    UpdateFile {
+        #[clap(long)]
+        file_path: String,
+        /// The multiaddresses of the peers to notify of the update
+        #[clap(long, use_value_delimiter = true)]
+        peers: Vec<Multiaddr>,
+    },
+}
+
+#[derive(ValueEnum, Clone, Debug)]
+enum CliRole {
+    Reader,
+    Contributor,
+    Admin,
+}
+
+impl From<CliRole> for Role {
+    fn from(role: CliRole) -> Self {
+        match role {
+            CliRole::Reader => Role::Reader,
+            CliRole::Contributor => Role::Contributor,
+            CliRole::Admin => Role::Admin,
+        }
+    }
 }
 
 #[tokio::main]
@@ -57,6 +94,12 @@ async fn main() {
         Commands::Ledger { json } => {
             if let Err(e) = display_ledger(json) {
                 log::error!("Failed to display ledger: {}", e);
+                process::exit(1);
+            }
+        },
+        Commands::ShowRoles => {
+            if let Err(e) = show_roles() {
+                log::error!("Failed to show roles: {}", e);
                 process::exit(1);
             }
         },
@@ -96,7 +139,32 @@ async fn main() {
                         process::exit(1);
                     }
                 },
-                _ => unreachable!(), // Already handled Ledger
+                Commands::SetRole { peer_id, role, admin_peer } => {
+                    let target_peer_id = match PeerId::from_str(&peer_id) {
+                        Ok(id) => id.to_bytes(),
+                        Err(e) => {
+                            log::error!("Invalid PeerId format: {}", e);
+                            process::exit(1);
+                        }
+                    };
+                    let command = ClientCommand::SetRole {
+                        target_peer_id,
+                        role: role.into(),
+                        admin_peer,
+                    };
+                    if let Err(e) = run_client(keypair, command).await {
+                        log::error!("Client command failed: {}", e);
+                        process::exit(1);
+                    }
+                },
+                Commands::UpdateFile { file_path, peers } => {
+                    let command = ClientCommand::UpdateFile { file_path, peers };
+                    if let Err(e) = run_client(keypair, command).await {
+                        log::error!("Client command failed: {}", e);
+                        process::exit(1);
+                    }
+                },
+                _ => unreachable!(), // Ledger and ShowRoles are handled
             }
         }
     }
@@ -148,7 +216,8 @@ fn display_ledger(use_json: bool) -> Result<(), Box<dyn std::error::Error>> {
                 EventType::FileLockRequested { file_path } => format!("FileLockRequested | File: {}", file_path),
                 EventType::LockGranted { file_path } => format!("LockGranted | File: {}", file_path),
                 EventType::LockDenied { file_path } => format!("LockDenied | File: {}", file_path),
-                EventType::FileUpdated { file_hash } => format!("FileUpdated | Hash: {}...", hex::encode(file_hash).chars().take(12).collect::<String>()),
+                EventType::FileUpdated { file_hash, .. } => format!("FileUpdated | Hash: {}...", hex::encode(file_hash).chars().take(12).collect::<String>()),
+                EventType::RoleUpdate { target_peer_id, new_role } => format!("RoleUpdate | Target: {}..., Role: {:?}", hex::encode(target_peer_id).chars().take(12).collect::<String>(), new_role),
             };
             let peer_id_short = hex::encode(&entry.peer_id).chars().take(12).collect::<String>();
             println!(
@@ -157,6 +226,26 @@ fn display_ledger(use_json: bool) -> Result<(), Box<dyn std::error::Error>> {
                 peer_id_short,
                 event_info
             );
+        }
+    }
+
+    Ok(())
+}
+
+fn show_roles() -> Result<(), Box<dyn std::error::Error>> {
+    let ledger = ledger_core::Ledger::load("p2p_ledger.dat")?;
+    let registry = RoleRegistry::new_from_ledger(&ledger);
+
+    println!("--- Role Registry ---");
+    if registry.roles().next().is_none() {
+        println!("No roles have been assigned yet.");
+    } else {
+        for (peer_id_bytes, role) in registry.roles() {
+            let peer_id_str = match PeerId::from_bytes(peer_id_bytes) {
+                Ok(pid) => pid.to_base58(),
+                Err(_) => hex::encode(peer_id_bytes),
+            };
+            println!("Peer: {:<52} | Role: {:?}", peer_id_str, role);
         }
     }
 

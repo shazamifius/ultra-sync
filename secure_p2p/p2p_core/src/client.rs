@@ -1,5 +1,6 @@
-use super::{P2pError, AppRequest, AppResponse, MyBehaviour, LockRequestPayload, SignedPayload, ManifestRequestPayload, ChunkRequestPayload, ManifestResponsePayload};
+use super::{P2pError, AppRequest, AppResponse, MyBehaviour, LockRequestPayload, SignedPayload, ManifestRequestPayload, ChunkRequestPayload, ManifestResponsePayload, RoleUpdateRequestPayload, RoleUpdateResponsePayload, UpdateFileRequestPayload, UpdateFileResponsePayload, create_file_manifest};
 use crypto::{Keypair, sign_data, hash_stream, verify_signature};
+use ledger_core::Role;
 use libp2p::{
     core::upgrade,
     noise,
@@ -22,6 +23,15 @@ pub enum ClientCommand {
     TransferFile {
         file_path: String,
         remote_addr: Multiaddr,
+    },
+    SetRole {
+        target_peer_id: Vec<u8>,
+        role: Role,
+        admin_peer: Multiaddr,
+    },
+    UpdateFile {
+        file_path: String,
+        peers: Vec<Multiaddr>,
     },
 }
 
@@ -191,6 +201,109 @@ pub async fn run_client(keypair: Keypair, command: ClientCommand) -> Result<(), 
 
             if let Err(_) = timeout {
                 return Err(P2pError::CommandFailed("Timeout waiting for file transfer".to_string()));
+            } else {
+                Ok(())
+            }
+        },
+        ClientCommand::SetRole { target_peer_id, role, admin_peer } => {
+            swarm.dial(admin_peer)?;
+
+            let timeout = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    match swarm.select_next_some().await {
+                        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                            let payload = RoleUpdateRequestPayload { target_peer_id: target_peer_id.clone(), new_role: role };
+                            let payload_bytes = bincode::serialize(&payload)?;
+                            let signature = sign_data(&payload_bytes, &keypair.signing_key);
+                            let signed_payload = SignedPayload { payload, signature: signature.to_bytes().to_vec() };
+                            swarm.behaviour_mut().request_response.send_request(&peer_id, AppRequest::RoleUpdateRequest(signed_payload));
+                        },
+                        SwarmEvent::Behaviour(super::MyBehaviourEvent::RequestResponse(request_response::Event::Message {
+                            message: request_response::Message::Response { response, .. },
+                            ..
+                        })) => {
+                            return match response {
+                                AppResponse::RoleUpdateResponse(RoleUpdateResponsePayload::Success) => {
+                                    log::info!("Role updated successfully!");
+                                    Ok(())
+                                },
+                                AppResponse::RoleUpdateResponse(RoleUpdateResponsePayload::PermissionDenied) => {
+                                    Err(P2pError::CommandFailed("Permission denied by admin peer.".to_string()))
+                                },
+                                _ => Err(P2pError::CommandFailed("Unexpected response from peer.".to_string())),
+                            };
+                        },
+                        _ => {}
+                    }
+                }
+            }).await;
+
+            if let Err(_) = timeout {
+                return Err(P2pError::CommandFailed("Timeout waiting for role update response".to_string()));
+            } else {
+                Ok(())
+            }
+        },
+        ClientCommand::UpdateFile { file_path, peers } => {
+            let manifest = create_file_manifest(std::path::Path::new(&file_path))?;
+            for addr in &peers {
+                swarm.dial(addr.clone())?;
+            }
+
+            let mut pending_dials = peers.len();
+            let mut connected_peers = std::collections::HashSet::new();
+            let mut pending_update_responses = 0;
+            let mut update_success_count = 0;
+
+            let timeout = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                loop {
+                    match swarm.select_next_some().await {
+                        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                            pending_dials -= 1;
+                            connected_peers.insert(peer_id);
+                            if pending_dials == 0 {
+                                pending_update_responses = connected_peers.len();
+                                for peer in &connected_peers {
+                                    let payload = UpdateFileRequestPayload { manifest: manifest.clone() };
+                                    let payload_bytes = bincode::serialize(&payload)?;
+                                    let signature = sign_data(&payload_bytes, &keypair.signing_key);
+                                    let signed_payload = SignedPayload { payload, signature: signature.to_bytes().to_vec() };
+                                    swarm.behaviour_mut().request_response.send_request(peer, AppRequest::UpdateFileRequest(signed_payload));
+                                }
+                            }
+                        },
+                        SwarmEvent::Behaviour(super::MyBehaviourEvent::RequestResponse(request_response::Event::Message {
+                            message: request_response::Message::Response { response, .. },
+                            ..
+                        })) => {
+                            match response {
+                                AppResponse::UpdateFileResponse(UpdateFileResponsePayload::Success) => {
+                                    update_success_count += 1;
+                                    pending_update_responses -= 1;
+                                    log::info!("Update successful with one peer.");
+                                },
+                                AppResponse::UpdateFileResponse(UpdateFileResponsePayload::LockNotHeld) => {
+                                    pending_update_responses -= 1;
+                                    log::error!("Update failed: Peer reports we do not hold the lock.");
+                                },
+                                _ => {}
+                            }
+                            if pending_update_responses == 0 {
+                                return if update_success_count == connected_peers.len() {
+                                    log::info!("All peers acknowledged the file update! Command successful.");
+                                    Ok(())
+                                } else {
+                                    Err(P2pError::CommandFailed("Failed to update file on all peers.".to_string()))
+                                }
+                            }
+                        },
+                        _ => {}
+                    }
+                }
+            }).await;
+
+            if let Err(_) = timeout {
+                return Err(P2pError::CommandFailed("Timeout waiting for file update responses".to_string()));
             } else {
                 Ok(())
             }
