@@ -1,0 +1,6 @@
+# Rust artifacts
+target/
+Cargo.lock
+
+# Ledger data file
+p2p_ledger.dat
