@@ -1,17 +1,21 @@
-use crypto::{CryptoError, Keypair};
+use crypto::{CryptoError, Keypair, sign_data, verify_signature};
 use futures::stream::StreamExt;
 use libp2p::{
     core::upgrade,
     identify, noise,
     request_response::{self, ProtocolSupport},
     swarm::{NetworkBehaviour, SwarmEvent},
-    tcp, yamux, Multiaddr, PeerId, SwarmBuilder, Transport, StreamProtocol,
+    tcp, yamux, Multiaddr, PeerId, SwarmBuilder, Transport, StreamProtocol, identity::PublicKey,
 };
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::time::{self, Interval};
 use std::convert::Infallible;
+use ledger_core::{Ledger, EventType};
+use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use ed25519_dalek::{Signature, VerifyingKey};
 
 #[derive(Debug, Error)]
 pub enum P2pError {
@@ -29,13 +33,28 @@ pub enum P2pError {
     Crypto(#[from] CryptoError),
     #[error("Infallible error: {0}")]
     Infallible(#[from] Infallible),
+    #[error("Bincode serialization error: {0}")]
+    Bincode(#[from] Box<bincode::ErrorKind>),
+    #[error("Ed25519 error: {0}")]
+    Ed25519(#[from] ed25519_dalek::SignatureError),
+    #[error("Invalid signature length")]
+    InvalidSignatureLength,
+    #[error("Unsupported public key type")]
+    UnsupportedPublicKey,
 }
 
+/// The content of the heartbeat that gets signed.
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Heartbeat {
+pub struct HeartbeatPayload {
     pub r#type: String,
     pub timestamp: u64,
-    pub peer_id: String,
+}
+
+/// The full Heartbeat message, including the signature.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Heartbeat {
+    pub payload: HeartbeatPayload,
+    pub signature: Vec<u8>,
 }
 
 #[derive(NetworkBehaviour)]
@@ -48,6 +67,9 @@ pub async fn run_swarm(keypair: Keypair, remote_addr: Option<Multiaddr>) -> Resu
     let local_key = keypair.to_libp2p_keypair()?;
     let local_peer_id = PeerId::from(local_key.public());
     log::info!("Local peer id: {}", local_peer_id);
+
+    let ledger = Arc::new(Mutex::new(Ledger::load("p2p_ledger.dat")?));
+    let peer_keys = Arc::new(Mutex::new(HashMap::<PeerId, PublicKey>::new()));
 
     let transport = tcp::tokio::Transport::new(tcp::Config::default().nodelay(true))
         .upgrade(upgrade::Version::V1Lazy)
@@ -94,11 +116,19 @@ pub async fn run_swarm(keypair: Keypair, remote_addr: Option<Multiaddr>) -> Resu
                 if !connected_peers.is_empty() {
                     log::info!("Sending heartbeat to {} connected peers...", connected_peers.len());
                     for peer_id in connected_peers {
-                        let heartbeat = Heartbeat {
+                        let payload = HeartbeatPayload {
                             r#type: "HEARTBEAT_ECHO".to_string(),
-                            timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
-                            peer_id: local_peer_id.to_string(),
+                            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
                         };
+
+                        let payload_bytes = bincode::serialize(&payload)?;
+                        let signature = sign_data(&payload_bytes, &keypair.signing_key);
+
+                        let heartbeat = Heartbeat {
+                            payload,
+                            signature: signature.to_bytes().to_vec(),
+                        };
+
                         swarm.behaviour_mut().request_response.send_request(&peer_id, heartbeat);
                     }
                 }
@@ -112,9 +142,10 @@ pub async fn run_swarm(keypair: Keypair, remote_addr: Option<Multiaddr>) -> Resu
                         peer_id,
                         info,
                     })) => {
-                        log::info!("Received identify info from {}: {:?}", peer_id, info.listen_addrs);
+                        log::info!("Received identify info from {}: listen_addrs={:?}, public_key available", peer_id, info.listen_addrs);
+                        peer_keys.lock().unwrap().insert(peer_id, info.public_key);
                         for addr in info.listen_addrs {
-                             swarm.behaviour_mut().request_response.add_address(&peer_id, addr);
+                             swarm.add_peer_address(peer_id, addr);
                         }
                     }
                     SwarmEvent::Behaviour(MyBehaviourEvent::RequestResponse(request_response::Event::Message {
@@ -123,19 +154,61 @@ pub async fn run_swarm(keypair: Keypair, remote_addr: Option<Multiaddr>) -> Resu
                     })) => {
                         match message {
                             request_response::Message::Request { request, channel,.. } => {
-                                log::info!("Received heartbeat request from {}: {:?}", peer, request);
-                                swarm.behaviour_mut().request_response.send_response(channel, request.clone()).unwrap();
+                                let public_key = match peer_keys.lock().unwrap().get(&peer) {
+                                    Some(pk) => pk.clone(),
+                                    None => {
+                                        log::warn!("Received heartbeat from peer {} without a stored public key. Ignoring.", peer);
+                                        continue;
+                                    }
+                                };
+
+                                let ed25519_pubkey = match public_key.try_into_ed25519() {
+                                    Ok(key) => key,
+                                    Err(_) => {
+                                        log::warn!("Received heartbeat from peer {} with a non-Ed25519 key. Ignoring.", peer);
+                                        continue;
+                                    }
+                                };
+
+                                let verifying_key = VerifyingKey::from_bytes(&ed25519_pubkey.to_bytes())?;
+                                let payload_bytes = bincode::serialize(&request.payload)?;
+                                let signature_bytes: [u8; 64] = match request.signature.as_slice().try_into() {
+                                    Ok(bytes) => bytes,
+                                    Err(_) => {
+                                        log::warn!("Received heartbeat from {} with an invalid signature length. Ignoring.", peer);
+                                        continue;
+                                    }
+                                };
+                                let signature = Signature::from_bytes(&signature_bytes);
+
+                                if verify_signature(&payload_bytes, &signature, &verifying_key) {
+                                    log::info!("Signature VERIFIED for heartbeat from {}", peer);
+
+                                    if let Err(e) = ledger.lock().unwrap().append_entry(peer.to_bytes(), EventType::HeartbeatReceived, payload_bytes) {
+                                        log::error!("Failed to write to ledger: {}", e);
+                                    }
+
+                                    swarm.behaviour_mut().request_response.send_response(channel, request.clone()).unwrap();
+                                } else {
+                                    log::warn!("Signature FAILED for heartbeat from {}. Ignoring.", peer);
+                                }
                             }
                             request_response::Message::Response { response, .. } => {
-                                log::info!("Received heartbeat response from peer: {:?}", response);
+                                log::info!("Received heartbeat response from peer: {:?}", response.payload);
                             }
                         }
                     }
                     SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                         log::info!("Connection established with {}", peer_id);
+                        if let Err(e) = ledger.lock().unwrap().append_entry(peer_id.to_bytes(), EventType::ConnectionEstablished, vec![]) {
+                            log::error!("Failed to write to ledger: {}", e);
+                        }
                     }
                      SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
                         log::info!("Connection to {} closed: {:?}", peer_id, cause);
+                        if let Err(e) = ledger.lock().unwrap().append_entry(peer_id.to_bytes(), EventType::ConnectionLost, vec![]) {
+                            log::error!("Failed to write to ledger: {}", e);
+                        }
                     }
                     SwarmEvent::Dialing{ peer_id: Some(peer_id), ..} => {
                         log::info!("Dialing {}", peer_id);
