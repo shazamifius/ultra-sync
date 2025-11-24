@@ -1,0 +1,16 @@
+[package]
+name = "p2p_core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libp2p = { version = "0.53.2", features = ["tcp", "noise", "yamux", "identify", "request-response", "macros", "kad", "cbor", "tokio"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+log = "0.4"
+futures = "0.3.30"
+
+# Workspace dependencies
+crypto = { path = "../crypto" }
