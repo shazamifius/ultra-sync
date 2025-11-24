@@ -31,6 +31,7 @@ pub enum EventType {
     FileLockRequested { file_path: String },
     LockGranted { file_path: String },
     LockDenied { file_path: String },
+    LeaseExpired { file_path: String },
     FileUpdated {
         file_hash: Vec<u8>,
         previous_manifest_hash: Option<Vec<u8>>,

@@ -222,14 +222,27 @@ fn handle_update_file_request(
     let file_path_str = signed_payload.payload.manifest.file_path.to_str().unwrap().to_string();
 
     // --- Lock Verification ---
-    let has_valid_lock = ledger_guard.entries.iter().rev()
-        .find(|e| matches!(&e.event_type, EventType::LockGranted { file_path } if file_path == &file_path_str))
-        .map_or(false, |entry| {
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-            let grant_time = entry.timestamp.timestamp() as u64;
-            let duration = bincode::deserialize::<u64>(&entry.payload).unwrap_or(0);
-            entry.peer_id == peer.to_bytes() && now < grant_time + duration
+    let last_lock_event = ledger_guard.entries.iter().rev()
+        .find(|e| match &e.event_type {
+            EventType::LockGranted { file_path: p } |
+            EventType::LockDenied { file_path: p } |
+            EventType::LeaseExpired { file_path: p } => p == &file_path_str,
+            _ => false,
         });
+
+    let has_valid_lock = match last_lock_event {
+        Some(entry) => {
+            if let EventType::LockGranted { .. } = &entry.event_type {
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                let grant_time = entry.timestamp.timestamp() as u64;
+                let duration = bincode::deserialize::<u64>(&entry.payload).unwrap_or(0);
+                entry.peer_id == peer.to_bytes() && now < grant_time + duration
+            } else {
+                false
+            }
+        },
+        None => false,
+    };
 
     if !has_valid_lock {
         log::warn!("Peer {} attempted to update file '{}' without a valid lock.", peer, file_path_str);
@@ -384,24 +397,30 @@ fn handle_lock_request(
 
     let mut ledger_guard = ledger.lock().unwrap();
 
-    let has_active_lease = ledger_guard.entries.iter().rev()
+    let last_lock_event = ledger_guard.entries.iter().rev()
         .find(|e| match &e.event_type {
-            EventType::LockGranted { file_path: locked_file } => locked_file == &file_path_str,
+            EventType::LockGranted { file_path: p } |
+            EventType::LockDenied { file_path: p } |
+            EventType::LeaseExpired { file_path: p } => p == &file_path_str,
             _ => false,
-        })
-        .map_or(false, |entry| {
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-            match bincode::deserialize::<u64>(&entry.payload) {
-                Ok(duration) => {
-                    let grant_time = entry.timestamp.timestamp() as u64;
-                    now < grant_time + duration
-                },
-                Err(e) => {
-                    log::error!("Failed to deserialize lease duration from ledger: {}. Assuming invalid lease.", e);
-                    false
-                }
-            }
         });
+
+    let has_active_lease = match last_lock_event {
+        Some(entry) => {
+            if let EventType::LockGranted { .. } = &entry.event_type {
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                let grant_time = entry.timestamp.timestamp() as u64;
+                if let Ok(duration) = bincode::deserialize::<u64>(&entry.payload) {
+                    now < grant_time + duration
+                } else {
+                    false // Deserialization failed, assume expired
+                }
+            } else {
+                false // It was denied or expired
+            }
+        },
+        None => false, // No lock event ever
+    };
 
     if has_active_lease {
         log::warn!("Lock denied for '{}': Active lease exists.", file_path_str);
@@ -552,7 +571,7 @@ pub async fn run_server(keypair: Keypair, remote_addr: Option<Multiaddr>) -> Res
         let mut registry = RoleRegistry::new_from_ledger(&ledger_guard);
         if !registry.has_admin() {
             log::info!("No admin found in the ledger. Promoting local peer to Admin.");
-            registry.set_initial_admin(local_peer_id_bytes);
+            registry.set_initial_admin(local_peer_id_bytes.clone());
         }
         Arc::new(Mutex::new(registry))
     };
@@ -588,9 +607,52 @@ pub async fn run_server(keypair: Keypair, remote_addr: Option<Multiaddr>) -> Res
     }
 
     let mut heartbeat_interval = time::interval(Duration::from_secs(10));
+    let mut lease_cleanup_interval = time::interval(Duration::from_secs(30));
 
     loop {
         tokio::select! {
+            _ = lease_cleanup_interval.tick() => {
+                log::debug!("Running lease cleanup task...");
+                let mut ledger_guard = ledger.lock().unwrap();
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+
+                let mut active_locks = std::collections::HashMap::new();
+
+                for entry in ledger_guard.entries.iter() {
+                    match &entry.event_type {
+                        EventType::LockGranted { file_path } => {
+                            active_locks.insert(file_path.clone(), entry.clone());
+                        },
+                        EventType::LockDenied { file_path } | EventType::LeaseExpired { file_path } => {
+                            active_locks.remove(file_path);
+                        },
+                        _ => {}
+                    }
+                }
+
+                let expired_files: Vec<_> = active_locks.into_iter()
+                    .filter_map(|(file_path, entry)| {
+                        if let Ok(duration) = bincode::deserialize::<u64>(&entry.payload) {
+                            let grant_time = entry.timestamp.timestamp() as u64;
+                            if now >= grant_time + duration {
+                                return Some(file_path);
+                            }
+                        }
+                        None
+                    })
+                    .collect();
+
+                for file_path in expired_files {
+                    log::info!("Lease for file '{}' has expired. Recording in ledger.", file_path);
+                    if let Err(e) = ledger_guard.append_entry(
+                        local_peer_id_bytes.clone(),
+                        EventType::LeaseExpired { file_path: file_path.clone() },
+                        vec![]
+                    ) {
+                        log::error!("Failed to append LeaseExpired event for '{}': {}", file_path, e);
+                    }
+                }
+            },
             _ = heartbeat_interval.tick() => {
                 let connected_peers: Vec<_> = swarm.connected_peers().cloned().collect();
                 if !connected_peers.is_empty() {
