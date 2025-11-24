@@ -1,0 +1,11 @@
+[workspace]
+members = [
+    "crypto",
+    "p2p_core",
+    "cli_app", "ledger_core",
+]
+
+[package]
+name = "secure_p2p"
+version = "0.1.0"
+edition = "2021"
