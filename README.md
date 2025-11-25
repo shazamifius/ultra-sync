@@ -50,7 +50,9 @@ Le système de contrôle d'accès basé sur les rôles (RBAC) définit trois niv
 
 ### Prérequis
 
-Assurez-vous d'avoir `Rust` et `Cargo` installés. Pour l'interface graphique, vous devrez également suivre les instructions d'installation de `Tauri`.
+-   **Rust et Cargo**: Nécessaires pour compiler le cœur de l'application. [Instructions d'installation](https://www.rust-lang.org/tools/install).
+-   **Node.js et npm**: Nécessaires uniquement si vous souhaitez compiler vous-même l'interface graphique. [Instructions d'installation](https://nodejs.org/).
+-   **Dépendances Tauri**: Si vous compilez l'interface graphique, suivez le [guide officiel de Tauri](https://tauri.app/v1/guides/getting-started/prerequisites) pour installer les dépendances spécifiques à votre système d'exploitation (outils de build, webview, etc.).
 
 ### Interface en Ligne de Commande (`cli_app`)
 
@@ -102,15 +104,47 @@ L'exécutable se trouvera dans `target/release/cli_app`.
 
 ### Interface Graphique (`p2p_ui`)
 
-#### Compilation
-```bash
-cd secure_p2p/p2p_ui/
-npm install
-npm run tauri build
-```
+L'interface graphique est la méthode recommandée pour la plupart des utilisateurs. Elle est autonome et gère le processus de synchronisation en arrière-plan.
+
+#### Compilation (pour les développeurs)
+
+Si vous souhaitez compiler l'application vous-même, suivez ces étapes :
+
+1.  **Naviguez vers le dossier de l'interface :**
+    ```bash
+    cd secure_p2p/p2p_ui/
+    ```
+
+2.  **Installez les dépendances JavaScript :**
+    ```bash
+    npm install
+    ```
+
+3.  **Compilez l'application :**
+    Cette commande va créer un exécutable natif pour votre système d'exploitation.
+    ```bash
+    npm run tauri build
+    ```
+    L'exécutable final se trouvera dans le dossier `secure_p2p/target/release/`, sous le nom `p2p_ui.exe` (Windows), `p2p_ui` (Linux) ou `p2p_ui.app` (macOS).
 
 #### Utilisation
-- Lancez l'application.
-- **Créer une session**: Choisissez un dossier à partager et cliquez sur "Démarrer la session". Si aucune clé n'existe, vous serez invité à créer un mot de passe.
-- **Rejoindre une session**: Entrez l'adresse d'un pair distant, choisissez un dossier local pour la synchronisation, et cliquez sur "Rejoindre".
-- Une fois connecté, le tableau de bord vous montrera les fichiers partagés, les participants et les options d'administration si vous êtes un administrateur.
+
+1.  **Lancement de l'application**
+    -   Double-cliquez simplement sur l'exécutable `p2p_ui` que vous avez compilé (ou téléchargé).
+    -   **Important**: Il n'est PAS nécessaire de lancer un autre programme. L'interface graphique s'occupe de démarrer le moteur de synchronisation en arrière-plan.
+
+2.  **Premier démarrage**
+    -   Si c'est votre première utilisation, l'application vous demandera de créer un mot de passe. Ce mot de passe protège votre clé d'identité unique sur le réseau. **Ne le perdez pas !**
+
+3.  **Démarrer ou rejoindre une session**
+    -   **Pour créer une nouvelle session de partage** :
+        1.  Cliquez sur le bouton "Choisir un dossier".
+        2.  Sélectionnez le dossier que vous souhaitez synchroniser.
+        3.  Cliquez sur "Démarrer la session".
+        4.  Une adresse unique sera affichée. Copiez-la et partagez-la avec les personnes que vous souhaitez inviter.
+    -   **Pour rejoindre une session existante** :
+        1.  Collez l'adresse que l'on vous a fournie dans le champ "Adresse du pair distant".
+        2.  Cliquez sur "Choisir un emplacement" pour décider où les fichiers synchronisés seront sauvegardés sur votre ordinateur.
+        3.  Cliquez sur "Rejoindre".
+
+Une fois connecté, le tableau de bord affiche l'état de la synchronisation, la liste des participants et les options de gestion disponibles.

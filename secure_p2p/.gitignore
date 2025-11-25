@@ -1,0 +1,12 @@
+# Rust
+target/
+Cargo.lock
+
+# Data
+*.dat
+
+# Node
+node_modules/
+
+# Logs
+*.log
