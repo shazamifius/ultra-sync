@@ -1,177 +1,116 @@
-# Secure P2P - Système de Fichiers Distribué et Sécurisé
+# Secure P2P - Synchronisation de Fichiers Sécurisée
 
-Ce projet implémente un système de fichiers distribué, sécurisé et versionné en Rust, basé sur une architecture pair-à-pair (P2P). Il permet à un groupe de pairs de collaborer sur un ensemble de fichiers de manière sécurisée, en prévenant les conflits d'édition et en garantissant l'intégrité et l'authenticité des données et des actions.
+**Secure P2P** est une application de synchronisation de fichiers en peer-to-peer conçue pour offrir un environnement de partage sécurisé, transparent et contrôlé. Elle permet à plusieurs utilisateurs de collaborer sur un ensemble de fichiers tout en garantissant l'intégrité et la traçabilité de chaque action grâce à un système de registre d'événements (ledger) immuable et à un contrôle d'accès basé sur les rôles.
 
-## 1. Concepts Fondamentaux
+## Objectif du Projet
 
-Pour comprendre le fonctionnement du système, il est essentiel de maîtriser les concepts suivants :
+L'objectif principal de ce projet est de fournir une solution de synchronisation de fichiers qui répond aux exigences suivantes :
 
-### A. Le Registre Immuable (`Ledger`)
+- **Sécurité Robuste**: Toutes les communications sont chiffrées de bout en bout, et chaque action est authentifiée par des signatures cryptographiques.
+- **Intégrité des Données**: Un registre d'événements (ledger) immuable, basé sur une chaîne de hachage, garantit que l'historique des actions ne peut être altéré.
+- **Contrôle d'Accès Granulaire**: Un système de rôles (Lecteur, Contributeur, Admin) permet de définir précisément les permissions de chaque utilisateur.
+- **Flexibilité d'Utilisation**: L'application est accessible via une interface en ligne de commande (CLI) pour les utilisateurs avancés et une interface graphique (GUI) pour une utilisation plus intuitive.
 
-Le cœur du système est un registre d'événements immuable, de type "journal d'audit" ou "blockchain", qui sert de **source unique de vérité**. Chaque action significative (une connexion, une demande de verrou, une mise à jour de rôle) est enregistrée comme un `LogEntry`. Ces entrées sont chaînées cryptographiquement les unes aux autres via un hachage **SHA-256**, rendant l'historique infalsifiable. Toute modification d'un événement passé briserait la chaîne et serait immédiatement détectée.
+## Architecture du Projet
 
-### B. L'Identité Cryptographique
+Le projet est structuré en plusieurs modules (`crates`) Rust, chacun ayant un rôle bien défini :
 
-Chaque pair sur le réseau possède une identité cryptographique unique sous la forme d'une paire de clés **Ed25519**. La clé privée, protégée sur le disque par un mot de passe et une combinaison d'**Argon2** et **ChaCha20-Poly135**, est utilisée pour signer numériquement toutes les actions importantes. La clé publique est partagée et permet aux autres pairs de vérifier ces signatures. Ce mécanisme garantit que chaque action est authentifiée et ne peut être répudiée.
+- **`crypto`**: Ce module gère toutes les opérations cryptographiques. Il est responsable de la génération et de la gestion des paires de clés (Ed25519), du chiffrement des clés privées sur le disque (avec Argon2 et ChaCha20-Poly1305), de la signature des données et du hachage des fichiers (SHA-256).
 
-### C. Le Réseau P2P (`libp2p`)
+- **`ledger_core`**: Il s'agit du cœur du système de traçabilité. Ce module implémente un registre d'événements immuable où chaque action (connexion, demande de verrou, mise à jour de fichier, etc.) est enregistrée sous forme d'entrée chaînée par hachage.
 
-Toutes les communications passent par le framework `libp2p`. Les connexions sont sécurisées de bout en bout (via le protocole `noise`), et la découverte de pairs se fait de manière décentralisée grâce à une table de hachage distribuée (DHT Kademlia).
+- **`p2p_core`**: Ce module gère toute la logique réseau peer-to-peer en utilisant le framework `libp2p`. Il est responsable de la découverte des pairs, de l'établissement des connexions, de la gestion des flux de communication et de la définition des protocoles d'échange de messages.
 
-### D. Le Contrôle d'Accès Basé sur les Rôles (ACL)
+- **`cli_app`**: Il s'agit de l'interface en ligne de commande (CLI) de l'application. Elle permet aux utilisateurs d'interagir avec le système via des commandes textuelles pour lancer un pair, se connecter à un réseau, gérer les fichiers et administrer les rôles.
 
-Le système implémente un contrôle d'accès basé sur trois rôles :
-- **`Reader`** : Peut consulter l'état et télécharger des fichiers.
-- **`Contributor`** : Peut demander des verrous et proposer des modifications de fichiers.
-- **`Admin`** : Peut modifier les rôles des autres pairs.
+- **`p2p_ui`**: C'est l'interface graphique utilisateur (GUI) de l'application, développée avec le framework `Tauri` et une interface en `React` (TypeScript). Elle offre une expérience utilisateur plus visuelle et intuitive pour les fonctionnalités de l'application.
 
-L'état des permissions est dérivé directement du registre. Le premier pair à initialiser le réseau devient `Admin` par défaut.
+## Concepts Fondamentaux
 
-### E. Le Système de Verrouillage Distribué (`Locking`)
+### Sécurité
 
-Pour éviter les conflits d'édition, un pair doit obtenir un "verrou" (ou "bail") sur un fichier avant de le modifier. Ce verrou est accordé par consensus des autres pairs, qui vérifient dans leur copie du registre qu'aucun autre bail actif n'existe pour ce fichier. Les verrous ont une durée de vie limitée et expirent automatiquement.
+La sécurité est au cœur de l'application. Chaque pair possède une identité cryptographique unique (une paire de clés Ed25519). Les clés privées sont chiffrées sur le disque avec un mot de passe et ne sont jamais transmises sur le réseau. Toutes les actions importantes sont encapsulées dans une charge utile signée (`SignedPayload`), ce qui permet de vérifier l'authenticité de chaque message.
 
-### F. Le Transfert de Fichiers par Morceaux (`Chunking`)
+### Ledger et Intégrité des Données
 
-Les fichiers volumineux sont divisés en morceaux ("chunks") de 1 Mo. Un **`FileManifest`** (manifeste de fichier) est d'abord échangé, décrivant le fichier, son hachage global et le hachage de chaque morceau. Les chunks sont ensuite transférés individuellement. Le destinataire vérifie le hachage de chaque morceau, garantissant l'intégrité du fichier final et permettant de reprendre un téléchargement interrompu.
+Le `ledger` est un journal d'événements qui enregistre chaque action effectuée sur le réseau. Chaque entrée contient un horodatage, l'ID du pair, le type d'événement et le hachage de l'entrée précédente. Cette structure de chaîne de hachage garantit qu'une fois qu'une entrée est écrite, elle ne peut plus être modifiée sans invalider toute la chaîne, assurant ainsi une traçabilité et une intégrité totales.
 
----
+### Synchronisation de Fichiers
 
-## 2. Architecture Technique
+Pour transférer des fichiers volumineux de manière efficace, l'application utilise un système de manifeste de fichier. Un manifeste contient des métadonnées sur le fichier, y compris sa taille, le hachage de chaque morceau (chunk) de 1 Mo et le hachage total du fichier. Lorsqu'un pair souhaite télécharger un fichier, il demande d'abord le manifeste, puis télécharge chaque morceau individuellement, en vérifiant le hachage de chacun.
 
-Le projet est structuré comme un "workspace" Rust, divisé en quatre modules (`crates`) principaux :
+### Contrôle d'Accès (RBAC)
 
-- **`crypto`** : Fournit toutes les primitives cryptographiques. Il gère la création, le stockage sécurisé et le chargement des clés, la signature des données et le hachage des fichiers.
-- **`ledger_core`** : Implémente la logique du registre immuable, la structure des événements, le chaînage cryptographique et la persistance sur disque.
-- **`p2p_core`** : Le cœur de l'application. Il gère la couche réseau avec `libp2p`, définit les protocoles de communication, et implémente toute la logique métier (gestion des verrous, transfert de fichiers, ACL). Il contient à la fois la logique du serveur (`run_server`) et du client (`run_client`).
-- **`cli_app`** : Le point d'entrée de l'application. Il fournit une interface en ligne de commande (`CLI`) conviviale pour que l'utilisateur puisse interagir avec le système, en analysant les commandes et en appelant les fonctions appropriées des autres modules.
+Le système de contrôle d'accès basé sur les rôles (RBAC) définit trois niveaux de permissions :
+- **`Reader` (Lecteur)**: Ne peut que recevoir les mises à jour des fichiers.
+- **`Contributor` (Contributeur)**: Peut demander des verrous sur les fichiers et les modifier.
+- **`Admin` (Administrateur)**: A tous les droits d'un contributeur et peut en plus assigner des rôles aux autres pairs.
 
----
+## Guide d'Utilisation
 
-## 3. Guide d'Installation
+### Prérequis
 
-Pour compiler le projet, vous devez avoir Rust et Cargo d'installés.
+Assurez-vous d'avoir `Rust` et `Cargo` installés. Pour l'interface graphique, vous devrez également suivre les instructions d'installation de `Tauri`.
 
+### Interface en Ligne de Commande (`cli_app`)
+
+#### Compilation
 ```bash
-# Clonez le dépôt (exemple)
-# git clone <url_du_depot>
-# cd secure_p2p
+cd secure_p2p/
+cargo build --release -p cli_app
+```
+L'exécutable se trouvera dans `target/release/cli_app`.
 
-# Compilez le projet
-cargo build --release
+#### Scénario d'Exemple : Alice et Bob
 
-# L'exécutable se trouvera dans ./target/release/cli_app
+1.  **Alice démarre une session**
+    Alice veut partager un dossier. Elle lance la commande `listen` pour démarrer un pair et attendre des connexions. La première fois, elle devra créer un mot de passe pour son identité.
+    ```bash
+    # Terminal d'Alice
+    ./target/release/cli_app listen
+    # Le programme affichera l'adresse d'écoute, par exemple :
+    # Listening on "/ip4/127.0.0.1/tcp/54321"
+    ```
+    Alice communique cette adresse à Bob.
+
+2.  **Bob rejoint la session**
+    Bob utilise l'adresse d'Alice pour se connecter au réseau.
+    ```bash
+    # Terminal de Bob
+    ./target/release/cli_app dial --remote-addr /ip4/127.0.0.1/tcp/54321
+    ```
+    Bob est maintenant connecté. Par défaut, il a le rôle de `Reader`.
+
+3.  **Alice promeut Bob**
+    Alice, en tant qu'administratrice de la session, peut changer le rôle de Bob. Elle a besoin de l'ID de pair de Bob (qu'elle peut trouver dans les logs ou en utilisant la commande `show-roles`).
+    ```bash
+    # Terminal d'Alice
+    ./target/release/cli_app set-role --peer-id <ID_DE_BOB> --role Contributor --admin-peer /ip4/127.0.0.1/tcp/54321
+    ```
+
+4.  **Bob modifie un fichier**
+    Maintenant que Bob est `Contributor`, il peut demander un verrou sur un fichier pour le modifier. Il demande un verrou sur `document.txt` à tous les pairs du réseau.
+    ```bash
+    # Terminal de Bob
+    ./target/release/cli_app request-lock --file-path document.txt --peers /ip4/127.0.0.1/tcp/54321
+    ```
+    Une fois le verrou accordé, Bob peut modifier le fichier localement. Ensuite, il notifie les autres de la mise à jour.
+    ```bash
+    # Terminal de Bob
+    ./target/release/cli_app update-file --file-path document.txt --peers /ip4/127.0.0.1/tcp/54321
+    ```
+
+### Interface Graphique (`p2p_ui`)
+
+#### Compilation
+```bash
+cd secure_p2p/p2p_ui/
+npm install
+npm run tauri build
 ```
 
----
-
-## 4. Manuel d'Utilisation de la CLI
-
-L'exécutable `cli_app` est l'outil principal pour interagir avec le réseau.
-
-### Démarrer un Nœud
-
-Un nœud est un pair qui tourne en continu, écoute les requêtes et participe à la vie du réseau.
-
-- **Démarrer un nœud et attendre des connexions :**
-  ```bash
-  ./cli_app listen
-  ```
-  Le nœud affichera son adresse (`Multiaddr`). Gardez-la pour que d'autres puissent se connecter.
-
-- **Démarrer un nœud et se connecter à un pair existant :**
-  ```bash
-  ./cli_app dial --remote-addr <multiaddr_du_pair_distant>
-  ```
-
-### Gérer les Fichiers
-
-- **Demander un verrou sur un fichier :**
-  Avant de modifier un fichier, vous devez obtenir un verrou.
-  ```bash
-  ./cli_app request-lock --file-path "mon_fichier.txt" --peers <addr_peer1>,<addr_peer2>
-  ```
-  La commande ne réussit que si **tous** les pairs spécifiés accordent le verrou.
-
-- **Notifier une mise à jour de fichier (après modification) :**
-  Après avoir modifié un fichier pour lequel vous détenez un verrou, notifiez les autres pairs.
-  ```bash
-  ./cli_app update-file --file-path "mon_fichier.txt" --peers <addr_peer1>,<addr_peer2>
-  ```
-
-- **Télécharger un fichier depuis un pair :**
-  ```bash
-  ./cli_app transfer-file --file-path "mon_fichier.txt" --peer-addr <addr_du_pair_source>
-  ```
-
-### Administration et Inspection
-
-- **Changer le rôle d'un pair (Admin requis) :**
-  ```bash
-  ./cli_app set-role --peer-id <peer_id_cible> --role Contributor --admin-peer <addr_du_pair_admin>
-  ```
-  Les rôles possibles sont `Reader`, `Contributor`, `Admin`.
-
-- **Afficher l'historique des événements :**
-  Inspectez le contenu du registre local.
-  ```bash
-  ./cli_app ledger
-  # Pour une sortie brute en JSON
-  ./cli_app ledger --json
-  ```
-
-- **Afficher l'état des permissions :**
-  Consultez la liste des rôles actuels, reconstituée à partir du registre.
-  ```bash
-  ./cli_app show-roles
-  ```
-
----
-
-## 5. Exemple de Scénario d'Utilisation
-
-Voici un flux de travail typique pour deux utilisateurs, **Alice (Admin)** et **Bob (Reader)**.
-
-1.  **Alice démarre le premier nœud :**
-    ```bash
-    # Alice lance son nœud
-    ./cli_app listen
-    # Sortie: Listening on /ip4/127.0.0.1/tcp/51234
-    ```
-    Alice est maintenant `Admin` car elle est la première sur le réseau.
-
-2.  **Bob rejoint le réseau :**
-    ```bash
-    # Bob se connecte au nœud d'Alice
-    ./cli_app dial --remote-addr /ip4/127.0.0.1/tcp/51234
-    ```
-    Bob est par défaut un `Reader`.
-
-3.  **Alice promeut Bob au rang de `Contributor` :**
-    Bob communique son `PeerId` à Alice. Alice exécute alors :
-    ```bash
-    # Alice (sur sa machine)
-    ./cli_app set-role --peer-id <peer_id_de_bob> --role Contributor --admin-peer /ip4/127.0.0.1/tcp/51234
-    ```
-
-4.  **Bob veut modifier `projet.txt` :**
-    Bob a besoin d'un verrou. Il le demande au nœud d'Alice :
-    ```bash
-    # Bob (sur sa machine)
-    ./cli_app request-lock --file-path "projet.txt" --peers /ip4/127.0.0.1/tcp/51234
-    ```
-
-5.  **Bob modifie le fichier et notifie la mise à jour :**
-    Une fois le verrou obtenu, Bob modifie `projet.txt` localement. Ensuite, il publie la mise à jour :
-    ```bash
-    # Bob
-    ./cli_app update-file --file-path "projet.txt" --peers /ip4/127.0.0.1/tcp/51234
-    ```
-    Un événement `FileUpdated` est enregistré dans le registre de tous les pairs connectés.
-
-6.  **Alice télécharge la nouvelle version :**
-    ```bash
-    # Alice
-    ./cli_app transfer-file --file-path "projet.txt" --peer-addr <addr_de_bob>
-    ```
-Le système garantit que chaque étape a été authentifiée, autorisée et enregistrée de manière immuable.
+#### Utilisation
+- Lancez l'application.
+- **Créer une session**: Choisissez un dossier à partager et cliquez sur "Démarrer la session". Si aucune clé n'existe, vous serez invité à créer un mot de passe.
+- **Rejoindre une session**: Entrez l'adresse d'un pair distant, choisissez un dossier local pour la synchronisation, et cliquez sur "Rejoindre".
+- Une fois connecté, le tableau de bord vous montrera les fichiers partagés, les participants et les options d'administration si vous êtes un administrateur.
