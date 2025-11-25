@@ -114,13 +114,13 @@ async fn main() {
 
             match cli.command {
                 Commands::Listen => {
-                    if let Err(e) = run_server(keypair, None).await {
+                    if let Err(e) = run_server(keypair, None, None, None, None).await {
                         log::error!("Server failed: {}", e);
                         process::exit(1);
                     }
                 },
                 Commands::Dial { remote_addr } => {
-                    if let Err(e) = run_server(keypair, Some(remote_addr)).await {
+                    if let Err(e) = run_server(keypair, Some(remote_addr), None, None, None).await {
                         log::error!("Server failed: {}", e);
                         process::exit(1);
                     }

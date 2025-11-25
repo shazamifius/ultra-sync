@@ -1,3 +1,4 @@
+use tauri::Emitter;
 use crypto::{CryptoError, Keypair, sign_data, verify_signature, hash_stream};
 use futures::stream::StreamExt;
 use libp2p::{
@@ -557,7 +558,47 @@ fn handle_chunk_request(
     Ok(())
 }
 
-pub async fn run_server(keypair: Keypair, remote_addr: Option<Multiaddr>) -> Result<(), P2pError> {
+use tokio::sync::mpsc;
+use std::str::FromStr;
+
+// Commandes reçues de l'interface
+#[derive(Debug)]
+pub enum P2pCommand {
+    SetRole {
+        target_peer_id: String,
+        role: Role,
+    },
+    ViewHistory,
+    ViewRoles,
+    UpdateFile { file_path: String },
+    TransferFile { file_path: String, target_peer_id: String },
+}
+
+#[derive(Serialize, Clone)]
+struct PeerPayload {
+    peer_id: String,
+}
+
+#[derive(Serialize, Clone)]
+struct LedgerEntryPayload {
+    timestamp: String,
+    peer_id: String,
+    event_info: String,
+}
+
+#[derive(Serialize, Clone)]
+struct RoleEntryPayload {
+    peer_id: String,
+    role: String,
+}
+
+pub async fn run_server(
+    keypair: Keypair,
+    remote_addr: Option<Multiaddr>,
+    addr_sender: Option<mpsc::Sender<String>>,
+    app_handle: Option<tauri::AppHandle>,
+    mut command_receiver: Option<mpsc::Receiver<P2pCommand>>,
+) -> Result<(), P2pError> {
     let local_key = keypair.to_libp2p_keypair()?;
     let local_peer_id_bytes = local_key.public().to_peer_id().to_bytes();
 
@@ -611,6 +652,11 @@ pub async fn run_server(keypair: Keypair, remote_addr: Option<Multiaddr>) -> Res
 
     loop {
         tokio::select! {
+            Some(command) = async { if let Some(rx) = &mut command_receiver { rx.recv().await } else { None } } => {
+                if let Err(e) = handle_p2p_command(command, &mut swarm, &keypair, &role_registry, &ledger, &app_handle) {
+                    log::error!("Failed to handle P2P command: {}", e);
+                }
+            },
             _ = lease_cleanup_interval.tick() => {
                 log::debug!("Running lease cleanup task...");
                 let mut ledger_guard = ledger.lock().unwrap();
@@ -775,4 +821,96 @@ mod tests {
         let reconstructed_hash = hash_stream(std::io::Cursor::new(reconstructed_data)).unwrap();
         assert_eq!(reconstructed_hash, manifest.total_hash);
     }
+}
+
+fn handle_p2p_command(
+    command: P2pCommand,
+    swarm: &mut libp2p::Swarm<MyBehaviour>,
+    keypair: &Keypair,
+    role_registry: &Arc<Mutex<RoleRegistry>>,
+    ledger: &Arc<Mutex<Ledger>>,
+    app_handle: &Option<tauri::AppHandle>,
+) -> Result<(), P2pError> {
+    match command {
+        P2pCommand::SetRole { target_peer_id, role } => {
+            let admin_peer_id = {
+                let registry = role_registry.lock().unwrap();
+                swarm.connected_peers()
+                    .find(|p| registry.is_admin(&p.to_bytes()))
+                    .cloned()
+            };
+
+            if let Some(admin_peer) = admin_peer_id {
+                let target_bytes = PeerId::from_str(&target_peer_id)
+                                        .map_err(|_| P2pError::CommandFailed("Invalid Target PeerId".to_string()))?
+                                        .to_bytes();
+
+                let payload = RoleUpdateRequestPayload {
+                    target_peer_id: target_bytes,
+                    new_role: role,
+                };
+                let payload_bytes = bincode::serialize(&payload)?;
+                let signature = sign_data(&payload_bytes, &keypair.signing_key);
+                let signed_payload = SignedPayload { payload, signature: signature.to_bytes().to_vec() };
+
+                swarm.behaviour_mut().request_response.send_request(&admin_peer, AppRequest::RoleUpdateRequest(signed_payload));
+                log::info!("Sent role update request to admin {}", admin_peer);
+
+            } else {
+                return Err(P2pError::CommandFailed("No admin peer is currently connected.".to_string()));
+            }
+        },
+        P2pCommand::ViewHistory => {
+            log::info!("--- UI COMMAND: View History ---");
+            let ledger_guard = ledger.lock().unwrap();
+            let entries_payload: Vec<LedgerEntryPayload> = ledger_guard.entries.iter().map(|entry| {
+                let event_info = match &entry.event_type {
+                    EventType::FileUpdated { file_hash, .. } => format!("FileUpdated | Hash: {}...", hex::encode(file_hash).chars().take(12).collect::<String>()),
+                    EventType::RoleUpdate { target_peer_id, new_role } => format!("RoleUpdate | Target: {}..., Role: {:?}", hex::encode(target_peer_id).chars().take(12).collect::<String>(), new_role),
+                    _ => format!("{:?}", entry.event_type),
+                };
+                LedgerEntryPayload {
+                    timestamp: entry.timestamp.to_rfc3339(),
+                    peer_id: PeerId::from_bytes(&entry.peer_id).unwrap().to_string(),
+                    event_info,
+                }
+            }).collect();
+            if let Some(handle) = &app_handle {
+                handle.emit("history-updated", entries_payload).unwrap();
+            }
+        },
+        P2pCommand::ViewRoles => {
+            log::info!("--- UI COMMAND: View Roles ---");
+            let registry = role_registry.lock().unwrap();
+            let roles_payload: Vec<RoleEntryPayload> = registry.roles().map(|(peer_id_bytes, role)| {
+                RoleEntryPayload {
+                    peer_id: PeerId::from_bytes(peer_id_bytes).unwrap().to_string(),
+                    role: format!("{:?}", role),
+                }
+            }).collect();
+            if let Some(handle) = &app_handle {
+                handle.emit("roles-updated", roles_payload).unwrap();
+            }
+        },
+        P2pCommand::UpdateFile { file_path } => {
+            let manifest = create_file_manifest(Path::new(&file_path))?;
+            let connected_peers: Vec<_> = swarm.connected_peers().cloned().collect();
+            for peer in &connected_peers {
+                let payload = UpdateFileRequestPayload { manifest: manifest.clone() };
+                let payload_bytes = bincode::serialize(&payload)?;
+                let signature = sign_data(&payload_bytes, &keypair.signing_key);
+                let signed_payload = SignedPayload { payload, signature: signature.to_bytes().to_vec() };
+                swarm.behaviour_mut().request_response.send_request(peer, AppRequest::UpdateFileRequest(signed_payload));
+            }
+            log::info!("Sent update for {} to {} peers", file_path, connected_peers.len());
+        },
+        P2pCommand::TransferFile { file_path, target_peer_id } => {
+            let peer_id = PeerId::from_str(&target_peer_id).map_err(|_| P2pError::CommandFailed("Invalid Target PeerId".to_string()))?;
+            let file_path_clone = file_path.clone();
+            let payload = ManifestRequestPayload { file_path };
+            swarm.behaviour_mut().request_response.send_request(&peer_id, AppRequest::ManifestRequest(payload));
+            log::info!("Requesting manifest for {} from {}", file_path_clone, peer_id);
+        },
+    }
+    Ok(())
 }
