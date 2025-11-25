@@ -1,8 +1,0 @@
-# Compiled artifacts
-/target/
-
-# Lock file
-Cargo.lock
-
-# Local data files
-*.dat
