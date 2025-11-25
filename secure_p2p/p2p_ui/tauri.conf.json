@@ -18,7 +18,10 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": null,
+      "ipc": {
+        "allow": ["plugin:dialog|open"]
+      }
     }
   },
   "bundle": {
@@ -31,5 +34,8 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "dialog": {}
   }
 }
