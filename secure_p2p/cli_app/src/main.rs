@@ -216,6 +216,7 @@ fn display_ledger(use_json: bool) -> Result<(), Box<dyn std::error::Error>> {
                 EventType::FileLockRequested { file_path } => format!("FileLockRequested | File: {}", file_path),
                 EventType::LockGranted { file_path } => format!("LockGranted | File: {}", file_path),
                 EventType::LockDenied { file_path } => format!("LockDenied | File: {}", file_path),
+                EventType::LeaseExpired { file_path } => format!("LeaseExpired | File: {}", file_path),
                 EventType::FileUpdated { file_hash, .. } => format!("FileUpdated | Hash: {}...", hex::encode(file_hash).chars().take(12).collect::<String>()),
                 EventType::RoleUpdate { target_peer_id, new_role } => format!("RoleUpdate | Target: {}..., Role: {:?}", hex::encode(target_peer_id).chars().take(12).collect::<String>(), new_role),
             };
