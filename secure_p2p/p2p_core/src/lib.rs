@@ -575,11 +575,6 @@ pub enum P2pCommand {
 }
 
 #[derive(Serialize, Clone)]
-struct PeerPayload {
-    peer_id: String,
-}
-
-#[derive(Serialize, Clone)]
 struct LedgerEntryPayload {
     timestamp: String,
     peer_id: String,
@@ -595,7 +590,7 @@ struct RoleEntryPayload {
 pub async fn run_server(
     keypair: Keypair,
     remote_addr: Option<Multiaddr>,
-    addr_sender: Option<mpsc::Sender<String>>,
+    _addr_sender: Option<mpsc::Sender<String>>,
     app_handle: Option<tauri::AppHandle>,
     mut command_receiver: Option<mpsc::Receiver<P2pCommand>>,
 ) -> Result<(), P2pError> {
