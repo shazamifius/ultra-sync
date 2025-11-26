@@ -4,6 +4,8 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::PathBuf;
 use thiserror::Error;
+#[cfg(windows)]
+use windows_dpapi::Scope;
 use libp2p;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
@@ -76,8 +78,8 @@ pub fn save_keypair(keypair: &Keypair, _passphrase: &str) -> Result<(), CryptoEr
     fs::write(public_key_path, keypair.verifying_key.as_bytes())?;
 
     let secret_key_bytes = keypair.signing_key.to_bytes();
-    let encrypted_secret_key = windows_dpapi::encrypt_data(&secret_key_bytes, None)
-        .map_err(|e| CryptoError::Aead)?; // Re-using Aead for simplicity
+    let encrypted_secret_key = windows_dpapi::encrypt_data(&secret_key_bytes, Scope::User)
+        .map_err(|_| CryptoError::Aead)?; // Re-using Aead for simplicity
 
     let secret_key_path = config_path.join(SECRET_KEY_FILE);
     fs::write(secret_key_path, encrypted_secret_key)?;
@@ -97,7 +99,7 @@ pub fn load_keypair(_passphrase: &str) -> Result<Keypair, CryptoError> {
 
     let secret_key_path = config_path.join(SECRET_KEY_FILE);
     let encrypted_secret_key = fs::read(secret_key_path)?;
-    let secret_key_bytes = windows_dpapi::decrypt_data(&encrypted_secret_key, None)
+    let secret_key_bytes = windows_dpapi::decrypt_data(&encrypted_secret_key, Scope::User)
         .map_err(|_| CryptoError::Aead)?; // Re-using Aead for simplicity
 
     let signing_key = SigningKey::from_bytes(
