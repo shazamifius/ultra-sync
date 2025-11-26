@@ -1,18 +1,11 @@
 use ed25519_dalek::{Signer, Signature, SigningKey, VerifyingKey, Verifier};
 use rand::rngs::OsRng;
-use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{self, Read};
 use std::path::PathBuf;
 use thiserror::Error;
-use chacha20poly1305::{
-    aead::{Aead, KeyInit},
-    ChaCha20Poly1305, Key, Nonce,
-};
-use argon2::{
-    password_hash::{rand_core::OsRng as ArgonOsRng, SaltString},
-    Argon2,
-};
+#[cfg(windows)]
+use windows_dpapi::Scope;
 use libp2p;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
@@ -20,7 +13,6 @@ use sha2::{Digest, Sha256};
 const CONFIG_DIR_NAME: &str = "secure_p2p";
 const PUBLIC_KEY_FILE: &str = "peer_id.pub";
 const SECRET_KEY_FILE: &str = "peer_id.priv";
-const AEAD_KEY_LENGTH: usize = 32;
 
 #[derive(Error, Debug)]
 pub enum CryptoError {
@@ -60,12 +52,6 @@ impl Keypair {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-struct EncryptedKeyFile {
-    ciphertext_hex: String,
-    nonce_hex: String,
-    salt_str: String,
-}
 
 pub fn generate_keypair() -> Keypair {
     let mut csprng = OsRng;
@@ -83,41 +69,26 @@ fn get_config_path() -> Result<PathBuf, CryptoError> {
         .ok_or(CryptoError::ConfigDirNotFound)
 }
 
-pub fn save_keypair(keypair: &Keypair, passphrase: &str) -> Result<(), CryptoError> {
+#[cfg(windows)]
+pub fn save_keypair(keypair: &Keypair, _passphrase: &str) -> Result<(), CryptoError> {
     let config_path = get_config_path()?;
     fs::create_dir_all(&config_path)?;
 
     let public_key_path = config_path.join(PUBLIC_KEY_FILE);
     fs::write(public_key_path, keypair.verifying_key.as_bytes())?;
 
-    let salt = SaltString::generate(&mut ArgonOsRng);
-    let argon2 = Argon2::default();
-    let mut key_material = [0u8; AEAD_KEY_LENGTH];
-    argon2.hash_password_into(passphrase.as_bytes(), salt.as_str().as_bytes(), &mut key_material)
-        .map_err(|e| CryptoError::Argon2(e.to_string()))?;
-
-    let key = Key::from_slice(&key_material);
-    let cipher = ChaCha20Poly1305::new(key);
-    let mut nonce_bytes = [0u8; 12];
-    OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
-
-    let ciphertext = cipher.encrypt(nonce, keypair.signing_key.as_bytes().as_ref()).map_err(|_| CryptoError::Aead)?;
-
-    let encrypted_file = EncryptedKeyFile {
-        ciphertext_hex: hex::encode(ciphertext),
-        nonce_hex: hex::encode(nonce_bytes),
-        salt_str: salt.to_string(),
-    };
-    let json_content = serde_json::to_string_pretty(&encrypted_file)?;
+    let secret_key_bytes = keypair.signing_key.to_bytes();
+    let encrypted_secret_key = windows_dpapi::encrypt_data(&secret_key_bytes, Scope::User)
+        .map_err(|_| CryptoError::Aead)?; // Re-using Aead for simplicity
 
     let secret_key_path = config_path.join(SECRET_KEY_FILE);
-    fs::write(secret_key_path, json_content)?;
+    fs::write(secret_key_path, encrypted_secret_key)?;
 
     Ok(())
 }
 
-pub fn load_keypair(passphrase: &str) -> Result<Keypair, CryptoError> {
+#[cfg(windows)]
+pub fn load_keypair(_passphrase: &str) -> Result<Keypair, CryptoError> {
     let config_path = get_config_path()?;
 
     let public_key_path = config_path.join(PUBLIC_KEY_FILE);
@@ -127,23 +98,43 @@ pub fn load_keypair(passphrase: &str) -> Result<Keypair, CryptoError> {
     let verifying_key = VerifyingKey::from_bytes(&public_key_bytes)?;
 
     let secret_key_path = config_path.join(SECRET_KEY_FILE);
-    let json_content = fs::read_to_string(secret_key_path)?;
-    let encrypted_file: EncryptedKeyFile = serde_json::from_str(&json_content)?;
+    let encrypted_secret_key = fs::read(secret_key_path)?;
+    let secret_key_bytes = windows_dpapi::decrypt_data(&encrypted_secret_key, Scope::User)
+        .map_err(|_| CryptoError::Aead)?; // Re-using Aead for simplicity
 
-    let salt = SaltString::from_b64(&encrypted_file.salt_str)
-         .map_err(|e| CryptoError::PasswordHash(e.to_string()))?;
-    let argon2 = Argon2::default();
-    let mut key_material = [0u8; AEAD_KEY_LENGTH];
-    argon2.hash_password_into(passphrase.as_bytes(), salt.as_str().as_bytes(), &mut key_material)
-        .map_err(|e| CryptoError::Argon2(e.to_string()))?;
+    let signing_key = SigningKey::from_bytes(
+        &secret_key_bytes.try_into().map_err(|_| CryptoError::InvalidLength("Invalid secret key length".to_string()))?
+    );
 
-    let key = Key::from_slice(&key_material);
-    let cipher = ChaCha20Poly1305::new(key);
-    let nonce_bytes = hex::decode(&encrypted_file.nonce_hex)?;
-    let nonce = Nonce::from_slice(&nonce_bytes);
-    let ciphertext = hex::decode(&encrypted_file.ciphertext_hex)?;
-    let secret_key_bytes = cipher.decrypt(nonce, ciphertext.as_ref()).map_err(|_| CryptoError::Aead)?;
+    Ok(Keypair { signing_key, verifying_key })
+}
 
+#[cfg(not(windows))]
+pub fn save_keypair(keypair: &Keypair, _passphrase: &str) -> Result<(), CryptoError> {
+    let config_path = get_config_path()?;
+    fs::create_dir_all(&config_path)?;
+
+    let public_key_path = config_path.join(PUBLIC_KEY_FILE);
+    fs::write(public_key_path, keypair.verifying_key.as_bytes())?;
+
+    let secret_key_path = config_path.join(SECRET_KEY_FILE);
+    fs::write(secret_key_path, keypair.signing_key.as_bytes())?;
+
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn load_keypair(_passphrase: &str) -> Result<Keypair, CryptoError> {
+    let config_path = get_config_path()?;
+
+    let public_key_path = config_path.join(PUBLIC_KEY_FILE);
+    let public_key_bytes: [u8; 32] = fs::read(public_key_path)?
+        .try_into()
+        .map_err(|_| CryptoError::InvalidLength("Invalid public key length".to_string()))?;
+    let verifying_key = VerifyingKey::from_bytes(&public_key_bytes)?;
+
+    let secret_key_path = config_path.join(SECRET_KEY_FILE);
+    let secret_key_bytes = fs::read(secret_key_path)?;
     let signing_key = SigningKey::from_bytes(
         &secret_key_bytes.try_into().map_err(|_| CryptoError::InvalidLength("Invalid secret key length".to_string()))?
     );
