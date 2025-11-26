@@ -19,3 +19,6 @@ hex = "0.4"
 p2p_core = { path = "../p2p_core" }
 crypto = { path = "../crypto" }
 ledger_core = { path = "../ledger_core" }
+
+[build-dependencies]
+winres = "0.1"

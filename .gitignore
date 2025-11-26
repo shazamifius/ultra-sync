@@ -1,0 +1,6 @@
+# Rust
+target/
+
+# General
+.DS_Store
+*.log
