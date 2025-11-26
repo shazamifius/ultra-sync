@@ -172,21 +172,14 @@ async fn main() {
 
 fn manage_keypair() -> Result<Keypair, CryptoError> {
     if keypair_exists() {
-        log::info!("Existing keypair found. Please enter your passphrase to unlock.");
-        let passphrase = prompt_password("Passphrase: ").unwrap();
-        load_keypair(&passphrase)
+        log::info!("Existing keypair found. Loading...");
+        // This will be replaced with secure loading in the next step
+        load_keypair("") // Pass an empty passphrase for now
     } else {
-        log::info!("No existing keypair found. Let's create one.");
-        let passphrase = prompt_password("Enter a new passphrase (will be used to encrypt your key): ").unwrap();
-        let confirm_passphrase = prompt_password("Confirm passphrase: ").unwrap();
-
-        if passphrase != confirm_passphrase {
-            return Err(CryptoError::PassphraseMismatch);
-        }
-
-        log::info!("Generating new keypair...");
+        log::info!("No existing keypair found. Generating a new one...");
         let keypair = generate_keypair();
-        save_keypair(&keypair, &passphrase)?;
+        // This will be replaced with secure saving in the next step
+        save_keypair(&keypair, "")?;
         log::info!("New keypair generated and saved successfully.");
         Ok(keypair)
     }
