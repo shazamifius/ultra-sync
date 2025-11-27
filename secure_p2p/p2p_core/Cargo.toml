@@ -17,7 +17,7 @@ ed25519-dalek = "2.1.1"
 tauri = "2.9.3"
 
 # Workspace dependencies
-crypto = { path = "../crypto" }
+crypto_core = { path = "../crypto_core" }
 ledger_core = { path = "../ledger_core" }
 
 [dev-dependencies]

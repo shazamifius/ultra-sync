@@ -31,5 +31,5 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 p2p_core = { path = "../p2p_core" }
 ledger_core = { path = "../ledger_core" }
-crypto = { path = "../crypto" }
+crypto_core = { path = "../crypto_core" }
 tokio = { version = "1", features = ["full"] }

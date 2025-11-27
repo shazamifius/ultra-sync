@@ -17,7 +17,7 @@ hex = "0.4"
 
 # Workspace dependencies
 p2p_core = { path = "../p2p_core" }
-crypto = { path = "../crypto" }
+crypto_core = { path = "../crypto_core" }
 ledger_core = { path = "../ledger_core" }
 
 [build-dependencies]
