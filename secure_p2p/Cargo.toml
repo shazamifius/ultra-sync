@@ -1,10 +1,11 @@
 [workspace]
 members = [
-    "crypto",
+    "crypto_core",
     "p2p_core",
     "cli_app",
     "ledger_core",
     "p2p_ui",
+    "presence_monitor",
 ]
 
 [package]

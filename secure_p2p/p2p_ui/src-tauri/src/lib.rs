@@ -1,7 +1,7 @@
 use tauri::Manager;
 use tokio::sync::{mpsc, Mutex};
 use p2p_core::run_server;
-use crypto::{Keypair, keypair_exists, load_keypair, generate_keypair, save_keypair};
+use crypto_core::{Keypair, keypair_exists, load_keypair, generate_keypair, save_keypair};
 use std::sync::Arc;
 use ledger_core::Role;
 use p2p_core::P2pCommand;

@@ -1,6 +1,6 @@
 use ledger_core::{Ledger, LogEntry, EventType, Role};
 use std::collections::HashMap;
-use crypto::{CryptoError};
+use crypto_core::{CryptoError};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
