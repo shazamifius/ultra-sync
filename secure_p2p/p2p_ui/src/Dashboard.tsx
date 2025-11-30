@@ -10,12 +10,18 @@ interface PeerPayload { peer_id: string; }
 interface LedgerEntryPayload { timestamp: string; peer_id: string; event_info: string; }
 interface RoleEntryPayload { peer_id: string; role: string; }
 
+// Updated Interface for Presence
+interface PresenceState {
+  file_path: string;
+  status: string;
+  peer_id: string;
+}
+
 // --- Composant AdminPanel ---
 const AdminPanel = () => {
     return (
       <div className="admin-panel">
         <h3>Panneau d'Administration</h3>
-        {/* La logique de changement de rôle et les boutons d'information seront ici */}
         <div className="admin-section">
           <h4>Consulter les informations</h4>
           <div className="info-buttons">
@@ -38,7 +44,8 @@ const Dashboard: React.FC<DashboardProps> = ({ onDisconnect, sharingAddress, sha
   const [participants, setParticipants] = useState<Participant[]>([]);
   const [files, setFiles] = useState<string[]>([]);
   const [modal, setModal] = useState({ isOpen: false, title: '', data: [] as any[] });
-  const [currentUserRole, setCurrentUserRole] = useState("Lecteur"); // Default to reader
+  const [currentUserRole, setCurrentUserRole] = useState("Lecteur");
+  const [presences, setPresences] = useState<PresenceState[]>([]); // New state for presences
 
   const status = "Connecté";
   const [showAdminPanel, setShowAdminPanel] = useState(false);
@@ -60,6 +67,14 @@ const Dashboard: React.FC<DashboardProps> = ({ onDisconnect, sharingAddress, sha
       listen<RoleEntryPayload[]>('roles-updated', (event) => {
         setModal({ isOpen: true, title: 'Registre des Rôles', data: event.payload });
       }),
+      // Listen for Presence Updates
+      listen<PresenceState>('presence-updated', (event) => {
+         setPresences(prev => {
+             // Replace existing entry for this peer+file or add new
+             const filtered = prev.filter(p => !(p.peer_id === event.payload.peer_id && p.file_path === event.payload.file_path));
+             return [...filtered, event.payload];
+         });
+      }),
     ];
 
     return () => {
@@ -73,18 +88,24 @@ const Dashboard: React.FC<DashboardProps> = ({ onDisconnect, sharingAddress, sha
   };
 
   const handleUpdate = async (fileName: string) => {
+    // Notify that I am editing
     const fullPath = await join(sharedFolderPath, fileName);
+    invoke('set_presence', { filePath: fullPath, status: "Editing" });
+
+    // In a real app, this would open the file, etc.
+    // For now, we simulate an "update" trigger
     invoke('update_file', { filePath: fullPath });
     alert(`Mise à jour pour "${fileName}" envoyée.`);
+
+    // Reset presence after a delay
+    setTimeout(() => {
+        invoke('set_presence', { filePath: fullPath, status: "Idle" });
+    }, 5000);
   };
 
-  const handleTransfer = async (fileName: string) => {
-    const targetPeer = prompt('Entrez l\'ID du pair depuis lequel télécharger :');
-    if (targetPeer) {
-      const fullPath = await join(sharedFolderPath, fileName);
-      invoke('transfer_file', { filePath: fullPath, targetPeerId: targetPeer });
-      alert(`Demande de transfert pour "${fileName}" envoyée à ${targetPeer}.`);
-    }
+  const getPresenceForFile = (fileName: string) => {
+      // Logic to find active presences for this file (ignoring full path for simple match for now)
+      return presences.filter(p => p.file_path.includes(fileName) && p.status === "Editing");
   };
 
   return (
@@ -117,15 +138,23 @@ const Dashboard: React.FC<DashboardProps> = ({ onDisconnect, sharingAddress, sha
         <div className="dashboard-card file-list-card">
             <h2>Fichiers Partagés</h2>
             <ul>
-                {files.map(file => (
+                {files.map(file => {
+                    const activeEditors = getPresenceForFile(file);
+                    return (
                     <li key={file}>
-                        <span>{file}</span>
+                        <div className="file-info">
+                            <span>{file}</span>
+                            {activeEditors.length > 0 && (
+                                <span className="presence-badge">
+                                    ✏️ {activeEditors.length} éditeur(s)
+                                </span>
+                            )}
+                        </div>
                         <div className="file-actions">
-                            <button className="button-outline" onClick={() => handleUpdate(file)}>Mettre à jour</button>
-                            <button className="button-outline" onClick={() => handleTransfer(file)}>Télécharger</button>
+                            <button className="button-outline" onClick={() => handleUpdate(file)}>Editer / Mettre à jour</button>
                         </div>
                     </li>
-                ))}
+                )})}
             </ul>
         </div>
 

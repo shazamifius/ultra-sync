@@ -4,3 +4,4 @@ target/
 # General
 .DS_Store
 *.log
+node_modules/

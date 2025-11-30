@@ -5,6 +5,11 @@ members = [
     "cli_app",
     "ledger_core",
     "p2p_ui",
+    "chunk_engine",
+    "sync_engine",
+    "conflict_solver",
+    "presence_monitor",
+    "crash_recovery",
 ]
 
 [package]

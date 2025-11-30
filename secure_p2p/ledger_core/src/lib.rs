@@ -28,10 +28,10 @@ pub enum EventType {
     ConnectionEstablished,
     ConnectionLost,
     HeartbeatReceived,
-    FileLockRequested { file_path: String },
-    LockGranted { file_path: String },
-    LockDenied { file_path: String },
-    LeaseExpired { file_path: String },
+    PresenceUpdate {
+        file_path: String,
+        status: String, // "Editing", "Viewing", "Idle"
+    },
     FileUpdated {
         file_hash: Vec<u8>,
         previous_manifest_hash: Option<Vec<u8>>,
@@ -230,7 +230,8 @@ mod tests {
         assert!(ledger.verify_integrity());
 
         let peer1 = b"peer1".to_vec();
-        ledger.append_entry(peer1.clone(), EventType::FileLockRequested { file_path: "file1.txt".to_string() }, vec![]).unwrap();
+        // Updated test case for PresenceUpdate instead of FileLockRequested
+        ledger.append_entry(peer1.clone(), EventType::PresenceUpdate { file_path: "file1.txt".to_string(), status: "Editing".to_string() }, vec![]).unwrap();
         ledger.append_entry(peer1, EventType::ConnectionLost, vec![]).unwrap();
 
         assert_eq!(ledger.entries.len(), 3);

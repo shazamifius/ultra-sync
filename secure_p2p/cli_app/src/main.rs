@@ -1,7 +1,6 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use crypto::{generate_keypair, keypair_exists, load_keypair, save_keypair, CryptoError, Keypair};
 use p2p_core::{client::{run_client, ClientCommand}, run_server, roles::RoleRegistry};
-use rpassword::prompt_password;
 use std::process;
 use ledger_core::{EventType, Role};
 use chrono::{DateTime, Utc};
@@ -30,16 +29,6 @@ enum Commands {
         #[clap(long)]
         json: bool,
     },
-    /// Request a lock for a file from a set of peers
-    RequestLock {
-        #[clap(long)]
-        file_path: String,
-        /// The multiaddresses of the peers to request the lock from
-        #[clap(long, use_value_delimiter = true)]
-        peers: Vec<Multiaddr>,
-        #[clap(long, default_value_t = 60)]
-        bail_duration: u64,
-    },
     /// Transfer a file from a remote peer
     TransferFile {
         #[clap(long)]
@@ -58,7 +47,7 @@ enum Commands {
     },
     /// Show the current roles from the local ledger
     ShowRoles,
-    /// Update a file after having acquired a lock
+    /// Update a file to connected peers (Notifies of update)
     UpdateFile {
         #[clap(long)]
         file_path: String,
@@ -125,13 +114,6 @@ async fn main() {
                         process::exit(1);
                     }
                 },
-                Commands::RequestLock { file_path, peers, bail_duration } => {
-                    let command = ClientCommand::RequestLock { file_path, peers, bail_duration };
-                    if let Err(e) = run_client(keypair, command).await {
-                        log::error!("Client command failed: {}", e);
-                        process::exit(1);
-                    }
-                },
                 Commands::TransferFile { file_path, peer_addr } => {
                     let command = ClientCommand::TransferFile { file_path, remote_addr: peer_addr };
                     if let Err(e) = run_client(keypair, command).await {
@@ -173,12 +155,10 @@ async fn main() {
 fn manage_keypair() -> Result<Keypair, CryptoError> {
     if keypair_exists() {
         log::info!("Existing keypair found. Loading...");
-        // This will be replaced with secure loading in the next step
         load_keypair("") // Pass an empty passphrase for now
     } else {
         log::info!("No existing keypair found. Generating a new one...");
         let keypair = generate_keypair();
-        // This will be replaced with secure saving in the next step
         save_keypair(&keypair, "")?;
         log::info!("New keypair generated and saved successfully.");
         Ok(keypair)
@@ -206,10 +186,7 @@ fn display_ledger(use_json: bool) -> Result<(), Box<dyn std::error::Error>> {
                 EventType::ConnectionEstablished => "ConnectionEstablished".to_string(),
                 EventType::ConnectionLost => "ConnectionLost".to_string(),
                 EventType::HeartbeatReceived => "HeartbeatReceived".to_string(),
-                EventType::FileLockRequested { file_path } => format!("FileLockRequested | File: {}", file_path),
-                EventType::LockGranted { file_path } => format!("LockGranted | File: {}", file_path),
-                EventType::LockDenied { file_path } => format!("LockDenied | File: {}", file_path),
-                EventType::LeaseExpired { file_path } => format!("LeaseExpired | File: {}", file_path),
+                EventType::PresenceUpdate { file_path, status } => format!("Presence | File: {} | Status: {}", file_path, status),
                 EventType::FileUpdated { file_hash, .. } => format!("FileUpdated | Hash: {}...", hex::encode(file_hash).chars().take(12).collect::<String>()),
                 EventType::RoleUpdate { target_peer_id, new_role } => format!("RoleUpdate | Target: {}..., Role: {:?}", hex::encode(target_peer_id).chars().take(12).collect::<String>(), new_role),
             };
