@@ -1,4 +1,4 @@
-use super::{P2pError, AppRequest, AppResponse, MyBehaviour, LockRequestPayload, SignedPayload, ManifestRequestPayload, ChunkRequestPayload, ManifestResponsePayload, RoleUpdateRequestPayload, RoleUpdateResponsePayload, UpdateFileRequestPayload, UpdateFileResponsePayload, create_file_manifest};
+use super::{P2pError, AppRequest, AppResponse, MyBehaviour, SignedPayload, ManifestRequestPayload, ChunkRequestPayload, ManifestResponsePayload, RoleUpdateRequestPayload, RoleUpdateResponsePayload, UpdateFileRequestPayload, UpdateFileResponsePayload};
 use crypto::{Keypair, sign_data, hash_stream, verify_signature};
 use ledger_core::Role;
 use libp2p::{
@@ -12,14 +12,10 @@ use futures::StreamExt;
 use std::fs::File;
 use std::io::Write;
 use ed25519_dalek::Signature;
+use chunk_engine::{create_file_manifest};
 
 #[derive(Debug, Clone)]
 pub enum ClientCommand {
-    RequestLock {
-        file_path: String,
-        peers: Vec<Multiaddr>,
-        bail_duration: u64,
-    },
     TransferFile {
         file_path: String,
         remote_addr: Multiaddr,
@@ -63,78 +59,15 @@ pub async fn run_client(keypair: Keypair, command: ClientCommand) -> Result<(), 
         .build();
 
     match command {
-        ClientCommand::RequestLock { file_path, peers, bail_duration } => {
-            for addr in &peers {
-                swarm.dial(addr.clone())?;
-            }
-
-            let mut pending_dials = peers.len();
-            let mut connected_peers = std::collections::HashSet::new();
-            let mut pending_lock_responses = 0;
-            let mut lock_granted_count = 0;
-
-            let timeout = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-                loop {
-                    match swarm.select_next_some().await {
-                        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                            pending_dials -= 1;
-                            connected_peers.insert(peer_id);
-                            if pending_dials == 0 {
-                                pending_lock_responses = connected_peers.len();
-                                for peer in &connected_peers {
-                                    let payload = LockRequestPayload { file_path: file_path.clone(), bail_duration };
-                                    let payload_bytes = bincode::serialize(&payload)?;
-                                    let signature = sign_data(&payload_bytes, &keypair.signing_key);
-                                    let signed_payload = SignedPayload { payload, signature: signature.to_bytes().to_vec() };
-                                    swarm.behaviour_mut().request_response.send_request(peer, AppRequest::LockRequest(signed_payload));
-                                }
-                            }
-                        },
-                        SwarmEvent::Behaviour(super::MyBehaviourEvent::RequestResponse(request_response::Event::Message {
-                            message: request_response::Message::Response { response, .. },
-                            ..
-                        })) => {
-                            match response {
-                                AppResponse::LockResponse(super::LockResponsePayload::Granted) => {
-                                    lock_granted_count += 1;
-                                    pending_lock_responses -= 1;
-                                    log::info!("Lock GRANTED received ({}/{})", lock_granted_count, pending_lock_responses + lock_granted_count);
-                                },
-                                AppResponse::LockResponse(super::LockResponsePayload::Denied) => {
-                                    pending_lock_responses -= 1;
-                                    log::error!("Lock DENIED received.");
-                                },
-                                _ => {}
-                            }
-                            if pending_lock_responses == 0 {
-                                return if lock_granted_count == connected_peers.len() {
-                                    log::info!("All peers granted the lock! Command successful.");
-                                    Ok(())
-                                } else {
-                                    Err(P2pError::CommandFailed("Failed to acquire lock from all peers.".to_string()))
-                                }
-                            }
-                        },
-                        _ => {}
-                    }
-                }
-            }).await;
-
-            if let Err(_) = timeout {
-                return Err(P2pError::CommandFailed("Timeout waiting for lock responses".to_string()));
-            } else {
-                Ok(())
-            }
-        }
         ClientCommand::TransferFile { file_path, remote_addr } => {
             swarm.dial(remote_addr)?;
-            let mut peer_id: Option<PeerId> = None;
+            let mut _peer_id: Option<PeerId> = None;
 
             let timeout = tokio::time::timeout(std::time::Duration::from_secs(30), async {
                 loop {
                     match swarm.select_next_some().await {
                         SwarmEvent::ConnectionEstablished { peer_id: established_peer_id, .. } => {
-                            peer_id = Some(established_peer_id);
+                            _peer_id = Some(established_peer_id);
                             let payload = ManifestRequestPayload { file_path: file_path.clone() };
                             swarm.behaviour_mut().request_response.send_request(&established_peer_id, AppRequest::ManifestRequest(payload));
                         },
@@ -282,9 +215,9 @@ pub async fn run_client(keypair: Keypair, command: ClientCommand) -> Result<(), 
                                     pending_update_responses -= 1;
                                     log::info!("Update successful with one peer.");
                                 },
-                                AppResponse::UpdateFileResponse(UpdateFileResponsePayload::LockNotHeld) => {
+                                AppResponse::UpdateFileResponse(UpdateFileResponsePayload::ConflictDetected) => {
                                     pending_update_responses -= 1;
-                                    log::error!("Update failed: Peer reports we do not hold the lock.");
+                                    log::error!("Update failed: Conflict detected.");
                                 },
                                 _ => {}
                             }
