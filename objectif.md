@@ -15,7 +15,7 @@ Ce système doit :
 * Assurer une cohérence parfaite des données même en cas de crash, coupure de courant ou fork du réseau.
 * Être résistant aux attaques, falsifications, corruptions et pertes de données.
 * Offrir un système anti‑écrasement pour les fichiers binaires utilisés dans les workflows créatifs (ex: Blender).
-* Rester extrêmement simple à utiliser pour l'utilisateur final.
+* Rester extrêmement simple à utiliser pour l'utilisateur final avec une interface graphique complet et simple utilisation.
 
 ---
 
