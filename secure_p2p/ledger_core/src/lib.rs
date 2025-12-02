@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use chrono::{DateTime, Utc};
 use std::fs::OpenOptions;
 use std::io::{self, BufReader, BufWriter};
@@ -96,9 +95,9 @@ impl LogEntry {
         };
 
         let serialized_content = bincode::serialize(&hashable_content)?;
-        let mut hasher = Sha256::new();
-        hasher.update(serialized_content);
-        Ok(hasher.finalize().to_vec())
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&serialized_content);
+        Ok(hasher.finalize().as_bytes().to_vec())
     }
 }
 

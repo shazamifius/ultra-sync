@@ -1,5 +1,5 @@
 use super::{P2pError, AppRequest, AppResponse, MyBehaviour, SignedPayload, ManifestRequestPayload, ChunkRequestPayload, ManifestResponsePayload, RoleUpdateRequestPayload, RoleUpdateResponsePayload, UpdateFileRequestPayload, UpdateFileResponsePayload};
-use crypto::{Keypair, sign_data, hash_stream, verify_signature};
+use crypto::{Keypair, sign_data, verify_signature};
 use ledger_core::Role;
 use libp2p::{
     core::upgrade,
@@ -9,10 +9,8 @@ use libp2p::{
     tcp, yamux, Multiaddr, SwarmBuilder, Transport, StreamProtocol, PeerId,
 };
 use futures::StreamExt;
-use std::fs::File;
-use std::io::Write;
 use ed25519_dalek::Signature;
-use chunk_engine::{create_file_manifest};
+use chunk_engine::{create_file_manifest, decompress_chunk, reconstruct_file, FileManifest};
 
 #[derive(Debug, Clone)]
 pub enum ClientCommand {
@@ -41,6 +39,7 @@ pub async fn run_client(keypair: Keypair, command: ClientCommand) -> Result<(), 
         .timeout(std::time::Duration::from_secs(20))
         .boxed();
 
+    let mdns = libp2p::mdns::tokio::Behaviour::new(libp2p::mdns::Config::default(), local_key.public().to_peer_id())?;
     let behaviour = MyBehaviour {
         request_response: request_response::cbor::Behaviour::new(
             [(StreamProtocol::new("/secure-p2p/app/1"), ProtocolSupport::Full)],
@@ -50,6 +49,7 @@ pub async fn run_client(keypair: Keypair, command: ClientCommand) -> Result<(), 
             "/secure-p2p/identify/1".into(),
             local_key.public(),
         )),
+        mdns,
     };
 
     let mut swarm = SwarmBuilder::with_existing_identity(local_key)
@@ -62,8 +62,12 @@ pub async fn run_client(keypair: Keypair, command: ClientCommand) -> Result<(), 
         ClientCommand::TransferFile { file_path, remote_addr } => {
             swarm.dial(remote_addr)?;
             let mut _peer_id: Option<PeerId> = None;
+            let mut active_manifest: Option<FileManifest> = None;
+            let mut chunks: Vec<Vec<u8>> = Vec::new();
+            let mut received_count = 0;
+            let mut total_chunks = 0;
 
-            let timeout = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let timeout = tokio::time::timeout(std::time::Duration::from_secs(60), async {
                 loop {
                     match swarm.select_next_some().await {
                         SwarmEvent::ConnectionEstablished { peer_id: established_peer_id, .. } => {
@@ -77,54 +81,59 @@ pub async fn run_client(keypair: Keypair, command: ClientCommand) -> Result<(), 
                         })) => {
                             match response {
                                 AppResponse::ManifestResponse(ManifestResponsePayload::Manifest(manifest)) => {
-                                    let mut file = File::create(&file_path)?;
-                                    let mut received_chunks = 0;
-                                    for i in 0..manifest.chunk_hashes.len() {
+                                    total_chunks = manifest.chunk_hashes.len();
+                                    chunks = vec![Vec::new(); total_chunks];
+                                    active_manifest = Some(manifest.clone());
+
+                                    for i in 0..total_chunks {
                                         let payload = ChunkRequestPayload { file_hash: manifest.total_hash.clone(), chunk_index: i as u32 };
                                         swarm.behaviour_mut().request_response.send_request(&peer, AppRequest::ChunkRequest(payload));
                                     }
+                                },
+                                AppResponse::ChunkResponse(signed_payload) => {
+                                    if let Some(manifest) = &active_manifest {
+                                        let payload_bytes = bincode::serialize(&signed_payload.payload)?;
+                                        let signature = Signature::from_bytes(match signed_payload.signature.as_slice().try_into() {
+                                            Ok(bytes) => bytes,
+                                            Err(_) => return Err(P2pError::CommandFailed("Invalid signature length".to_string())),
+                                        });
+                                        let verifying_key = keypair.verifying_key;
 
-                                    loop {
-                                        match swarm.select_next_some().await {
-                                            SwarmEvent::Behaviour(super::MyBehaviourEvent::RequestResponse(request_response::Event::Message {
-                                                message: request_response::Message::Response { response, .. },
-                                                ..
-                                            })) => {
-                                                match response {
-                                                    AppResponse::ChunkResponse(signed_payload) => {
-                                                        let payload_bytes = bincode::serialize(&signed_payload.payload)?;
-                                                        let signature = Signature::from_bytes(match signed_payload.signature.as_slice().try_into() {
-                                                            Ok(bytes) => bytes,
-                                                            Err(_) => return Err(P2pError::CommandFailed("Invalid signature length".to_string())),
-                                                        });
-                                                        let verifying_key = keypair.verifying_key;
+                                        if verify_signature(&payload_bytes, &signature, &verifying_key) {
+                                            let chunk_data = match decompress_chunk(&signed_payload.payload.chunk_data) {
+                                                Ok(data) => data,
+                                                Err(e) => return Err(P2pError::CommandFailed(format!("Decompression error: {}", e))),
+                                            };
 
-                                                        if verify_signature(&payload_bytes, &signature, &verifying_key) {
-                                                            let chunk_hash = hash_stream(std::io::Cursor::new(&signed_payload.payload.chunk_data))?;
-                                                            if chunk_hash == manifest.chunk_hashes[signed_payload.payload.chunk_index as usize] {
-                                                                file.write_all(&signed_payload.payload.chunk_data)?;
-                                                                received_chunks += 1;
-                                                                if received_chunks == manifest.chunk_hashes.len() {
-                                                                    log::info!("File transfer complete.");
-                                                                    return Ok(());
-                                                                }
-                                                            } else {
-                                                                return Err(P2pError::CommandFailed("Chunk hash mismatch".to_string()));
-                                                            }
-                                                        } else {
-                                                            return Err(P2pError::CommandFailed("Chunk signature verification failed".to_string()));
-                                                        }
+                                            let index = signed_payload.payload.chunk_index as usize;
+                                            if index >= total_chunks {
+                                                 return Err(P2pError::CommandFailed("Invalid chunk index".to_string()));
+                                            }
+
+                                            if chunks[index].is_empty() {
+                                                chunks[index] = chunk_data;
+                                                received_count += 1;
+                                            }
+
+                                            if received_count == total_chunks {
+                                                log::info!("All chunks received. Reconstructing file...");
+                                                match reconstruct_file(std::path::Path::new(&file_path), chunks.clone(), manifest) {
+                                                    Ok(_) => {
+                                                        log::info!("File transfer and reconstruction complete.");
+                                                        return Ok(());
                                                     },
-                                                    _ => {}
+                                                    Err(e) => return Err(P2pError::CommandFailed(format!("Reconstruction failed: {}", e))),
                                                 }
-                                            },
-                                            _ => {}
+                                            }
+                                        } else {
+                                            return Err(P2pError::CommandFailed("Chunk signature verification failed".to_string()));
                                         }
                                     }
                                 },
-                                _ => {
-                                    return Err(P2pError::CommandFailed("Failed to get manifest".to_string()));
+                                AppResponse::ManifestResponse(ManifestResponsePayload::NotFound) => {
+                                     return Err(P2pError::CommandFailed("File not found on remote peer.".to_string()));
                                 }
+                                _ => {}
                             }
                         },
                         _ => {}
