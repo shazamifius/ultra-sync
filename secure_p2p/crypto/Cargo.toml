@@ -16,6 +16,8 @@ hex = "0.4"
 thiserror = "1.0"
 libp2p = { version = "0.53.2", features = ["ed25519"] }
 sha2 = "0.10"
+blake3 = "1.8.2"
+keyring = "3.6.3"
 
 [target.'cfg(windows)'.dependencies]
 windows-dpapi = "0.1.0"

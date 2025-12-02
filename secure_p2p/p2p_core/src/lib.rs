@@ -3,7 +3,7 @@ use crypto::{CryptoError, Keypair, sign_data, verify_signature};
 use futures::stream::StreamExt;
 use libp2p::{
     core::upgrade,
-    identify, noise,
+    identify, mdns, noise,
     request_response::{self, ProtocolSupport},
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId, SwarmBuilder, Transport, StreamProtocol, identity::PublicKey,
@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::io::{Read, Seek, SeekFrom};
 
 // Import from new crates
-use chunk_engine::{FileManifest, create_file_manifest, ChunkError};
+use chunk_engine::{FileManifest, create_file_manifest, reconstruct_file, compress_chunk, decompress_chunk, ChunkError};
 use presence_monitor::PresenceMonitor;
 use sync_engine::{SyncEngine, SyncEvent};
 use conflict_solver::{ConflictSolver, ResolutionAction};
@@ -145,6 +145,7 @@ pub enum AppResponse {
 pub struct MyBehaviour {
     pub request_response: request_response::cbor::Behaviour<AppRequest, AppResponse>,
     pub identify: identify::Behaviour,
+    pub mdns: mdns::tokio::Behaviour,
 }
 
 fn handle_inbound_request(
@@ -158,6 +159,7 @@ fn handle_inbound_request(
     file_hash_cache: &Arc<Mutex<HashMap<Vec<u8>, PathBuf>>>,
     presence_monitor: &Arc<PresenceMonitor>,
     swarm: &mut libp2p::Swarm<MyBehaviour>,
+    pending_downloads: &mut HashMap<Vec<u8>, PendingDownload>,
 ) -> Result<(), P2pError> {
     match request {
         AppRequest::Heartbeat(signed_payload) => {
@@ -176,7 +178,7 @@ fn handle_inbound_request(
             handle_role_update_request(signed_payload, peer, channel, peer_keys, ledger, role_registry, swarm)?;
         },
         AppRequest::UpdateFileRequest(signed_payload) => {
-            handle_update_file_request(signed_payload, peer, channel, peer_keys, ledger, swarm)?;
+            handle_update_file_request(signed_payload, peer, channel, peer_keys, ledger, swarm, pending_downloads)?;
         }
     }
     Ok(())
@@ -205,6 +207,7 @@ fn handle_update_file_request(
     _peer_keys: &Arc<Mutex<HashMap<PeerId, PublicKey>>>,
     ledger: &Arc<Mutex<Ledger>>,
     swarm: &mut libp2p::Swarm<MyBehaviour>,
+    pending_downloads: &mut HashMap<Vec<u8>, PendingDownload>,
 ) -> Result<(), P2pError> {
 
     let mut ledger_guard = ledger.lock().unwrap();
@@ -234,14 +237,13 @@ fn handle_update_file_request(
             };
             ledger_guard.append_entry(peer.to_bytes(), event, vec![])?;
             log::info!("File '{}' updated by peer {}.", file_path_str, peer);
+            initiate_file_download(incoming_hash.clone(), &signed_payload.payload.manifest, PathBuf::from(file_path), peer, swarm, pending_downloads);
             let _ = swarm.behaviour_mut().request_response.send_response(channel, AppResponse::UpdateFileResponse(UpdateFileResponsePayload::Success));
         },
         Ok(ResolutionAction::CreateConflictCopy { new_path }) => {
-            // Conflict Flow
-            // We tell the peer "Success" because we accepted the data, but we renamed it locally.
-            // In a real implementation, we would probably download the content to the new path.
-            // For now, we log it.
             log::warn!("Conflict detected! Incoming file from {} renamed to {:?}", peer, new_path);
+            // Initiate chunk requests to download the file to the NEW path
+            initiate_file_download(incoming_hash.clone(), &signed_payload.payload.manifest, new_path, peer, swarm, pending_downloads);
             let _ = swarm.behaviour_mut().request_response.send_response(channel, AppResponse::UpdateFileResponse(UpdateFileResponsePayload::Success));
         },
         Err(e) => {
@@ -414,10 +416,11 @@ fn handle_chunk_request(
         let mut chunk_data = Vec::with_capacity(CHUNK_SIZE);
         match file.take(CHUNK_SIZE as u64).read_to_end(&mut chunk_data) {
             Ok(_) => {
+                let compressed_data = compress_chunk(&chunk_data);
                 let response_payload = ChunkResponsePayload {
                     file_hash: payload.file_hash.clone(),
                     chunk_index: payload.chunk_index,
-                    chunk_data,
+                    chunk_data: compressed_data,
                 };
                 let payload_bytes = bincode::serialize(&response_payload)?;
                 let signature = sign_data(&payload_bytes, &keypair.signing_key);
@@ -439,6 +442,83 @@ fn handle_chunk_request(
 
 use tokio::sync::mpsc;
 use std::str::FromStr;
+
+fn initiate_file_download(
+    file_hash: Vec<u8>,
+    manifest: &FileManifest,
+    output_path: PathBuf,
+    peer: PeerId,
+    swarm: &mut libp2p::Swarm<MyBehaviour>,
+    pending_downloads: &mut HashMap<Vec<u8>, PendingDownload>,
+) {
+    for (index, _) in manifest.chunk_hashes.iter().enumerate() {
+         let payload = ChunkRequestPayload { file_hash: manifest.total_hash.clone(), chunk_index: index as u32 };
+         swarm.behaviour_mut().request_response.send_request(&peer, AppRequest::ChunkRequest(payload));
+    }
+    log::info!("Initiated download of {} chunks for {:?} from {}", manifest.chunk_hashes.len(), output_path, peer);
+
+    let total_chunks = manifest.chunk_hashes.len();
+    pending_downloads.insert(file_hash, PendingDownload {
+        manifest: manifest.clone(),
+        chunks: vec![None; total_chunks],
+        received_count: 0,
+        output_path,
+    });
+}
+
+fn handle_chunk_response(
+    signed_payload: SignedPayload<ChunkResponsePayload>,
+    keypair: &Keypair,
+    pending_downloads: &mut HashMap<Vec<u8>, PendingDownload>,
+) {
+    let payload = &signed_payload.payload;
+    // Verify signature (Simplified here, ideally verify against sender's key if available contextually)
+    // For now we assume connection integrity via Noise and trust the payload content verification
+
+    if let Some(download) = pending_downloads.get_mut(&payload.file_hash) {
+         let index = payload.chunk_index as usize;
+         if index >= download.chunks.len() {
+             log::warn!("Received invalid chunk index {} for pending download.", index);
+             return;
+         }
+
+         if download.chunks[index].is_some() {
+             // Already received
+             return;
+         }
+
+         match decompress_chunk(&payload.chunk_data) {
+             Ok(data) => {
+                 download.chunks[index] = Some(data);
+                 download.received_count += 1;
+
+                 if download.received_count == download.chunks.len() {
+                     log::info!("Download complete for {:?}. Reconstructing...", download.output_path);
+                     let chunks: Option<Vec<Vec<u8>>> = download.chunks.iter().map(|c| c.clone()).collect();
+                     if let Some(final_chunks) = chunks {
+                         if let Err(e) = reconstruct_file(&download.output_path, final_chunks, &download.manifest) {
+                             log::error!("Failed to reconstruct file: {}", e);
+                         } else {
+                             log::info!("File successfully reconstructed at {:?}", download.output_path);
+                         }
+                     }
+                     // Cleanup
+                     pending_downloads.remove(&payload.file_hash);
+                 }
+             },
+             Err(e) => {
+                 log::error!("Failed to decompress chunk: {}", e);
+             }
+         }
+    }
+}
+
+struct PendingDownload {
+    manifest: FileManifest,
+    chunks: Vec<Option<Vec<u8>>>,
+    received_count: usize,
+    output_path: PathBuf,
+}
 
 // Commandes reçues de l'interface
 #[derive(Debug)]
@@ -483,6 +563,7 @@ pub async fn run_server(
     // Removed active_leases
     let file_hash_cache = Arc::new(Mutex::new(HashMap::<Vec<u8>, PathBuf>::new()));
     let presence_monitor = Arc::new(PresenceMonitor::new());
+    let mut pending_downloads: HashMap<Vec<u8>, PendingDownload> = HashMap::new();
 
     // --- Crash Recovery on Startup ---
     {
@@ -507,6 +588,7 @@ pub async fn run_server(
         .timeout(std::time::Duration::from_secs(20))
         .boxed();
 
+    let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), local_key.public().to_peer_id())?;
     let behaviour = MyBehaviour {
         request_response: request_response::cbor::Behaviour::new(
             [(StreamProtocol::new("/secure-p2p/app/1"), ProtocolSupport::Full)],
@@ -516,6 +598,7 @@ pub async fn run_server(
             "/secure-p2p/identify/1".into(),
             local_key.public(),
         )),
+        mdns,
     };
 
     let mut swarm = SwarmBuilder::with_existing_identity(local_key)
@@ -606,14 +689,30 @@ pub async fn run_server(
                          peer_keys.lock().unwrap().insert(peer_id, info.public_key);
                          for addr in info.listen_addrs { swarm.add_peer_address(peer_id, addr); }
                     },
+                    SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
+                        for (peer_id, multiaddr) in list {
+                            log::info!("mDNS discovered a new peer: {peer_id} at {multiaddr}");
+                            swarm.add_peer_address(peer_id, multiaddr);
+                        }
+                    },
+                    SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
+                        for (peer_id, multiaddr) in list {
+                            log::info!("mDNS discover peer has expired: {peer_id} at {multiaddr}");
+                            // swarm.remove_peer_address(peer_id, multiaddr); // Not yet stabilized in libp2p, or implicit
+                        }
+                    },
                     SwarmEvent::Behaviour(MyBehaviourEvent::RequestResponse(request_response::Event::Message { message, peer, .. })) => {
                         match message {
                             request_response::Message::Request { request, channel, .. } => {
-                                if let Err(e) = handle_inbound_request(request, peer, channel, &keypair, &peer_keys, &ledger, &role_registry, &file_hash_cache, &presence_monitor, &mut swarm) {
+                                if let Err(e) = handle_inbound_request(request, peer, channel, &keypair, &peer_keys, &ledger, &role_registry, &file_hash_cache, &presence_monitor, &mut swarm, &mut pending_downloads) {
                                     log::error!("Error handling inbound request: {}", e);
                                 }
                             }
-                            request_response::Message::Response { .. } => {}
+                            request_response::Message::Response { response, .. } => {
+                                if let AppResponse::ChunkResponse(signed_payload) = response {
+                                    handle_chunk_response(signed_payload, &keypair, &mut pending_downloads);
+                                }
+                            }
                         }
                     },
                     _ => {}

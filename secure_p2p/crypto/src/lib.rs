@@ -6,13 +6,16 @@ use std::path::PathBuf;
 use thiserror::Error;
 #[cfg(windows)]
 use windows_dpapi::Scope;
+#[cfg(not(windows))]
+use keyring::Entry;
 use libp2p;
 use rand::RngCore;
-use sha2::{Digest, Sha256};
 
 const CONFIG_DIR_NAME: &str = "secure_p2p";
 const PUBLIC_KEY_FILE: &str = "peer_id.pub";
-const SECRET_KEY_FILE: &str = "peer_id.priv";
+const SECRET_KEY_FILE: &str = "peer_id.priv"; // Used on Windows only
+const KEYRING_SERVICE: &str = "secure_p2p";
+const KEYRING_USER: &str = "peer_identity";
 
 #[derive(Error, Debug)]
 pub enum CryptoError {
@@ -38,6 +41,8 @@ pub enum CryptoError {
     Libp2pIdentity(#[from] libp2p::identity::DecodingError),
     #[error("Passphrases do not match")]
     PassphraseMismatch,
+    #[error("Keyring error: {0}")]
+    Keyring(String),
 }
 
 pub struct Keypair {
@@ -79,7 +84,7 @@ pub fn save_keypair(keypair: &Keypair, _passphrase: &str) -> Result<(), CryptoEr
 
     let secret_key_bytes = keypair.signing_key.to_bytes();
     let encrypted_secret_key = windows_dpapi::encrypt_data(&secret_key_bytes, Scope::User)
-        .map_err(|_| CryptoError::Aead)?; // Re-using Aead for simplicity
+        .map_err(|_| CryptoError::Aead)?;
 
     let secret_key_path = config_path.join(SECRET_KEY_FILE);
     fs::write(secret_key_path, encrypted_secret_key)?;
@@ -100,7 +105,7 @@ pub fn load_keypair(_passphrase: &str) -> Result<Keypair, CryptoError> {
     let secret_key_path = config_path.join(SECRET_KEY_FILE);
     let encrypted_secret_key = fs::read(secret_key_path)?;
     let secret_key_bytes = windows_dpapi::decrypt_data(&encrypted_secret_key, Scope::User)
-        .map_err(|_| CryptoError::Aead)?; // Re-using Aead for simplicity
+        .map_err(|_| CryptoError::Aead)?;
 
     let signing_key = SigningKey::from_bytes(
         &secret_key_bytes.try_into().map_err(|_| CryptoError::InvalidLength("Invalid secret key length".to_string()))?
@@ -117,8 +122,10 @@ pub fn save_keypair(keypair: &Keypair, _passphrase: &str) -> Result<(), CryptoEr
     let public_key_path = config_path.join(PUBLIC_KEY_FILE);
     fs::write(public_key_path, keypair.verifying_key.as_bytes())?;
 
-    let secret_key_path = config_path.join(SECRET_KEY_FILE);
-    fs::write(secret_key_path, keypair.signing_key.as_bytes())?;
+    // Use Keyring for secret key
+    let entry = Entry::new(KEYRING_SERVICE, KEYRING_USER).map_err(|e| CryptoError::Keyring(e.to_string()))?;
+    let secret_hex = hex::encode(keypair.signing_key.to_bytes());
+    entry.set_password(&secret_hex).map_err(|e| CryptoError::Keyring(e.to_string()))?;
 
     Ok(())
 }
@@ -133,10 +140,13 @@ pub fn load_keypair(_passphrase: &str) -> Result<Keypair, CryptoError> {
         .map_err(|_| CryptoError::InvalidLength("Invalid public key length".to_string()))?;
     let verifying_key = VerifyingKey::from_bytes(&public_key_bytes)?;
 
-    let secret_key_path = config_path.join(SECRET_KEY_FILE);
-    let secret_key_bytes = fs::read(secret_key_path)?;
+    // Load from Keyring
+    let entry = Entry::new(KEYRING_SERVICE, KEYRING_USER).map_err(|e| CryptoError::Keyring(e.to_string()))?;
+    let secret_hex = entry.get_password().map_err(|e| CryptoError::Keyring(e.to_string()))?;
+    let secret_bytes = hex::decode(secret_hex)?;
+
     let signing_key = SigningKey::from_bytes(
-        &secret_key_bytes.try_into().map_err(|_| CryptoError::InvalidLength("Invalid secret key length".to_string()))?
+        &secret_bytes.try_into().map_err(|_| CryptoError::InvalidLength("Invalid secret key length".to_string()))?
     );
 
     Ok(Keypair { signing_key, verifying_key })
@@ -144,8 +154,23 @@ pub fn load_keypair(_passphrase: &str) -> Result<Keypair, CryptoError> {
 
 pub fn keypair_exists() -> bool {
     if let Ok(config_path) = get_config_path() {
-        config_path.join(PUBLIC_KEY_FILE).exists() &&
-        config_path.join(SECRET_KEY_FILE).exists()
+        if !config_path.join(PUBLIC_KEY_FILE).exists() {
+            return false;
+        }
+
+        #[cfg(windows)]
+        {
+            return config_path.join(SECRET_KEY_FILE).exists();
+        }
+
+        #[cfg(not(windows))]
+        {
+            // Check keyring
+             if let Ok(entry) = Entry::new(KEYRING_SERVICE, KEYRING_USER) {
+                 return entry.get_password().is_ok();
+             }
+             return false;
+        }
     } else {
         false
     }
@@ -163,11 +188,11 @@ pub fn verify_signature(data: &[u8], signature: &Signature, verifying_key: &Veri
     verifying_key.verify(data, signature).is_ok()
 }
 
-/// Hashes a data stream using SHA-256.
+/// Hashes a data stream using BLAKE3.
 /// This is efficient for large files as it reads them in chunks.
 pub fn hash_stream<R: Read>(mut reader: R) -> io::Result<Vec<u8>> {
-    let mut hasher = Sha256::new();
-    let mut buffer = [0; 8192]; // 8KB chunks
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0; 65536]; // 64KB chunks (larger buffer is often better for throughput)
 
     loop {
         let bytes_read = reader.read(&mut buffer)?;
@@ -177,7 +202,7 @@ pub fn hash_stream<R: Read>(mut reader: R) -> io::Result<Vec<u8>> {
         hasher.update(&buffer[..bytes_read]);
     }
 
-    Ok(hasher.finalize().to_vec())
+    Ok(hasher.finalize().as_bytes().to_vec())
 }
 
 
@@ -212,8 +237,8 @@ mod tests {
 
         let hash = hash_stream(cursor).unwrap();
 
-        // Pre-computed SHA-256 hash of "hello world"
-        let expected_hash_hex = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+        // BLAKE3 hash of "hello world"
+        let expected_hash_hex = "d74981efa70a0c880b8d8c1985d075dbcbf679b99a5f9914e5aaf96b831a9e24";
         assert_eq!(hex::encode(hash), expected_hash_hex);
     }
 
@@ -235,9 +260,9 @@ mod tests {
         assert_eq!(file_hash, memory_hash);
 
         // Also hash the data directly to ensure correctness
-        let mut hasher = Sha256::new();
+        let mut hasher = blake3::Hasher::new();
         hasher.update(&large_data);
-        let direct_hash = hasher.finalize().to_vec();
+        let direct_hash = hasher.finalize().as_bytes().to_vec();
         assert_eq!(file_hash, direct_hash);
     }
 }
